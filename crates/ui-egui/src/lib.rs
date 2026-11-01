@@ -198,6 +198,7 @@ pub mod params_dialog;
 pub mod personal_sheet_rules;
 pub(crate) mod pick_index;
 pub(crate) mod place_gizmo;
+pub mod plasma_cam;
 pub(crate) mod plugins;
 pub mod point_clouds;
 pub mod prefs;
@@ -541,6 +542,8 @@ pub struct SolveApp {
     saving: Option<save_job::Saving>,
     pub viewport: viewport::ViewportState,
     pub render_workspace: render_workspace::State,
+    /// The Plasma CAM workspace: parts, nest, cut chart and quote.
+    pub plasma_cam: plasma_cam::State,
     pub tool: Option<tools::Tool>,
     pub dialog: Option<dialogs::Dialog>,
     /// The Change Parameters window, when open.
@@ -797,6 +800,7 @@ impl SolveApp {
             saving: None,
             viewport: viewport::ViewportState::default(),
             render_workspace,
+            plasma_cam: plasma_cam::State::default(),
             tool: None,
             dialog: None,
             params: None,
@@ -2962,7 +2966,8 @@ impl SolveApp {
         let floating = render_workspace::active(self) || ui_kit::Container::new(ui.ctx(), ui_kit::Surface::Panel).floating();
         timeline::follow_view_pick(self);
         render_ui::focus_shortcut(self, ui);
-        let show_timeline = self.ui.show_timeline && !render_workspace::active(self) && !self.preferences.history_in_browser;
+        let show_timeline =
+            self.ui.show_timeline && !render_workspace::active(self) && !plasma_cam::active(self) && !self.preferences.history_in_browser;
         let left_timeline = show_timeline && self.preferences.timeline_left;
         timeline_left::animate_folds(self, ui.ctx());
         if !floating && !self.embedded {
@@ -2977,7 +2982,7 @@ impl SolveApp {
             timeline::timeline(self, ui);
         }
         // Browser hugs its contents in either layout; it never becomes a full-height blank column.
-        if !self.ui.show_browser || render_ui::focused(self) {
+        if !self.ui.show_browser || render_ui::focused(self) || plasma_cam::active(self) {
             self.shell.browser = None;
             shell::register_panel(self, "render:browser", None, None);
             shell::register_panel(self, "render:appearances", None, None);
@@ -3031,7 +3036,7 @@ impl SolveApp {
             render_ui::shots_strip(self, ui);
             render_workspace::panel(self, ui);
         }
-        if self.ui.show_browser && !render_ui::focused(self) {
+        if self.ui.show_browser && !render_ui::focused(self) && !plasma_cam::active(self) {
             browser::browser(self, ui);
         }
         if floating {
@@ -3088,6 +3093,8 @@ impl SolveApp {
     fn show_workspace(&mut self, ui: &mut egui::Ui) {
         if render_workspace::active(self) {
             render_workspace::show(self, ui);
+        } else if plasma_cam::active(self) {
+            plasma_cam::show(self, ui);
         } else {
             viewport::show(self, ui);
         }

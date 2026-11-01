@@ -1134,7 +1134,7 @@ pub(crate) fn ribbon_label(app: &SolveApp, label: &str) -> String {
     app.tr_label(&label).to_string()
 }
 
-fn ribbon_text(ui: &egui::Ui, at: egui::Pos2, text: &str, size: f32, color: Color32, bold: bool) {
+pub(crate) fn ribbon_text(ui: &egui::Ui, at: egui::Pos2, text: &str, size: f32, color: Color32, bold: bool) {
     let text = egui::RichText::new(text).size(size).color(color);
     let text = if bold { text.semibold() } else { text };
     let galley = egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Button);
@@ -1413,7 +1413,8 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
         if render {
             crate::ui_kit::StageBar::workspace(ui, ws, "ws_render", app.tr("ui.render"), app.tr("ui.ribbon_workspace"));
         } else {
-            let workspace_icon = if render { "ws_render" } else { "ws_design" };
+            let plasma = crate::plasma_cam::active(app);
+            let workspace_icon = if plasma { "cam" } else { "ws_design" };
             icons::paint_icon(
                 &painter,
                 Rect::from_center_size(pos2(ws.center().x, ws.top() + if labels { 39.0 } else { 25.0 }), vec2(30.0, 30.0)),
@@ -1423,7 +1424,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
             ribbon_text(
                 ui,
                 pos2(ws.center().x, ws.top() + if labels { 69.0 } else { 50.0 }),
-                app.tr(if render { "ui.render" } else { "ui.design" }),
+                if plasma { app.tr_label("Plasma CAM") } else { app.tr("ui.design") },
                 t.font_button,
                 t.text,
                 true,
@@ -1448,6 +1449,10 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
         crate::scenario::publish_target("ribbon:workspace", ws);
         if render {
             crate::render_ui::stage_bar(app, ui, cards.ribbon);
+            return;
+        }
+        if crate::plasma_cam::active(app) {
+            crate::plasma_cam::ribbon(app, ui, Rect::from_min_max(pos2(ribbon_left, r.top()), r.max));
             return;
         }
         ribbon_tabs(app, ui, Rect::from_min_max(pos2(ribbon_left, r.top()), pos2(r.right(), r.top() + TAB_ROW_HEIGHT)));

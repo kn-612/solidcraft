@@ -1,0 +1,6 @@
+{
+  "en": {
+    "ui.workspace_plasma_description": "CNC plasma: DXF nesting, toolpaths, G-code and quotes",
+    "ui.workspace_plasma_tabs": "Setup · Nest · Toolpath · Quote"
+  }
+}

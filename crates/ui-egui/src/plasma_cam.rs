@@ -1,0 +1,1229 @@
+//! Plasma CAM workspace: DXF parts, true-shape sheet nesting, toolpaths with QtPlasmaC G-code (true arcs), a
+//! SheetCAM-compatible tool library, and quotes priced by material and thickness. It shares the window, ribbon
+//! frame and theme with Design; only the ribbon tabs and the page below them change. The arithmetic lives in
+//! `plasma_cam_logic.rs`.
+
+use egui::{Align2, Color32, FontId, Rect, Sense, Shape, Stroke, pos2, vec2};
+
+use crate::SolveApp;
+use crate::fonts::RichTextExt;
+use crate::theme::Tokens;
+
+#[path = "plasma_cam_logic.rs"]
+pub(crate) mod logic;
+
+use logic::{Contour, Cut, MM_PER_IN, Metal, Nest, NestSettings, Part, PostSettings, Pricing, Tool};
+
+/// `app.ui.tab` while the Plasma CAM workspace is showing.
+pub const TAB: &str = "PLASMA";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Page {
+    #[default]
+    Setup,
+    Nest,
+    Toolpath,
+    Quote,
+}
+
+impl Page {
+    const ALL: [Page; 4] = [Page::Setup, Page::Nest, Page::Toolpath, Page::Quote];
+    fn label(self) -> &'static str {
+        match self {
+            Page::Setup => "Setup",
+            Page::Nest => "Nest",
+            Page::Toolpath => "Toolpath",
+            Page::Quote => "Quote",
+        }
+    }
+}
+
+/// Which tools the library list shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Filter {
+    All,
+    Metal(Metal),
+    Oxy,
+}
+
+impl Filter {
+    const ALL: [Filter; 5] = [Filter::All, Filter::Metal(Metal::Steel), Filter::Metal(Metal::Stainless), Filter::Metal(Metal::Aluminum), Filter::Oxy];
+    fn label(self) -> &'static str {
+        match self {
+            Filter::All => "All",
+            Filter::Metal(m) => m.label(),
+            Filter::Oxy => "Oxy-fuel",
+        }
+    }
+    fn keeps(self, t: &Tool) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Metal(m) => !t.oxy && t.metal == m,
+            Filter::Oxy => t.oxy,
+        }
+    }
+}
+
+const ROTATIONS: [(f64, &str); 5] = [(0.0, "No Rotation"), (180.0, "Rotate 180°"), (90.0, "Rotate 90°"), (45.0, "Rotate 45°"), (15.0, "Rotate 15°")];
+
+/// The toolpath and G-code for one sheet, kept until something they depend on changes.
+struct Posted {
+    key: String,
+    cuts: Vec<Cut>,
+    code: String,
+}
+
+pub struct State {
+    pub page: Page,
+    pub parts: Vec<Part>,
+    /// Colour slot per part (stable when parts are removed).
+    colours: Vec<usize>,
+    next_colour: usize,
+    /// Shading triangles per part, per contour.
+    tris: Vec<Vec<Vec<[usize; 3]>>>,
+    pub selected: Option<usize>,
+    pub sheet_w_in: f64,
+    pub sheet_h_in: f64,
+    pub spacing_in: f64,
+    pub margin_in: f64,
+    pub rotation_step: f64,
+    pub part_in_part: bool,
+    pub max_sheets: usize,
+    pub nest: Option<Nest>,
+    /// Bumped whenever the nest changes, so cached toolpaths know.
+    nest_rev: u64,
+    #[cfg(not(target_arch = "wasm32"))]
+    job: Option<std::sync::mpsc::Receiver<Nest>>,
+    pub sheet: usize,
+    pub tools: Vec<Tool>,
+    pub tool: usize,
+    filter: Filter,
+    /// Scroll the tool list to the picked tool on the next frame.
+    reveal_tool: bool,
+    pub pricing: Pricing,
+    pub post: PostSettings,
+    posted: Option<Posted>,
+    pub metric: bool,
+    pub message: Option<(String, bool)>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        let tools = logic::default_tools();
+        let tool = tools.iter().position(|t| t.name == "65A 1/4 Steel").unwrap_or(0);
+        Self {
+            page: Page::Setup,
+            parts: Vec::new(),
+            colours: Vec::new(),
+            next_colour: 0,
+            tris: Vec::new(),
+            selected: None,
+            sheet_w_in: 96.0,
+            sheet_h_in: 48.0,
+            spacing_in: 0.25,
+            margin_in: 0.5,
+            rotation_step: 90.0,
+            part_in_part: true,
+            max_sheets: 50,
+            nest: None,
+            nest_rev: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            job: None,
+            sheet: 0,
+            tools,
+            tool,
+            filter: Filter::Metal(Metal::Steel),
+            reveal_tool: true,
+            pricing: Pricing::default(),
+            post: PostSettings::default(),
+            posted: None,
+            metric: false,
+            message: None,
+        }
+    }
+}
+
+impl State {
+    fn settings(&self) -> NestSettings {
+        NestSettings {
+            sheet_w: self.sheet_w_in * MM_PER_IN,
+            sheet_h: self.sheet_h_in * MM_PER_IN,
+            spacing: self.spacing_in * MM_PER_IN,
+            margin: self.margin_in * MM_PER_IN,
+            rotation_step: self.rotation_step,
+            max_sheets: self.max_sheets,
+            part_in_part: self.part_in_part,
+        }
+    }
+    fn tool(&self) -> Option<&Tool> {
+        self.tools.get(self.tool).or_else(|| self.tools.first())
+    }
+    fn colour(&self, part: usize) -> Color32 {
+        crate::theme::part_colour(self.colours.get(part).copied().unwrap_or(part))
+    }
+    fn add_part(&mut self, part: Part) {
+        self.tris.push(part.contours.iter().map(|c| logic::triangulate(&c.pts)).collect());
+        self.parts.push(part);
+        self.colours.push(self.next_colour);
+        self.next_colour += 1;
+        self.set_nest(None);
+    }
+    fn set_nest(&mut self, nest: Option<Nest>) {
+        self.nest = nest;
+        self.nest_rev += 1;
+        self.posted = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.job = None;
+        }
+    }
+    fn clear(&mut self) {
+        self.parts.clear();
+        self.tris.clear();
+        self.colours.clear();
+        self.next_colour = 0;
+        self.selected = None;
+        self.sheet = 0;
+        self.set_nest(None);
+    }
+    fn remove(&mut self, i: usize) {
+        if i < self.parts.len() {
+            self.parts.remove(i);
+        }
+        if i < self.tris.len() {
+            self.tris.remove(i);
+        }
+        if i < self.colours.len() {
+            self.colours.remove(i);
+        }
+        self.selected = None;
+        self.set_nest(None);
+    }
+    fn busy(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.job.is_some()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+    fn run_nest(&mut self) {
+        if self.parts.is_empty() {
+            self.message = Some(("Add parts before nesting.".into(), true));
+            return;
+        }
+        let parts = self.parts.clone();
+        let settings = self.settings();
+        self.set_nest(None);
+        self.sheet = 0;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawned = std::thread::Builder::new().name("plasma-nest".into()).spawn(move || {
+                let _ = tx.send(logic::nest(&parts, &settings));
+            });
+            match spawned {
+                Ok(_) => {
+                    self.job = Some(rx);
+                    self.message = Some(("Nesting…".into(), false));
+                }
+                Err(e) => self.message = Some((format!("Could not start nesting: {e}"), true)),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let n = logic::nest(&parts, &settings);
+            self.finish_nest(n);
+        }
+    }
+    fn finish_nest(&mut self, n: Nest) {
+        let placed = n.placements.len();
+        self.message = Some(if n.unplaced.is_empty() && n.truncated == 0 {
+            (format!("Nested {placed} parts on {} sheet(s).", n.sheets), false)
+        } else {
+            (format!("Nested {placed} parts; {} did not fit the sheet.", n.unplaced.len() + n.truncated), true)
+        });
+        self.set_nest(Some(n));
+    }
+    /// Collect a finished background nest.
+    fn poll(&mut self, ctx: &egui::Context) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(rx) = &self.job {
+            match rx.try_recv() {
+                Ok(n) => {
+                    self.job = None;
+                    self.finish_nest(n);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.job = None;
+                    self.message = Some(("Nesting stopped unexpectedly.".into(), true));
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = ctx;
+    }
+    /// The toolpath and G-code for the current sheet (cached).
+    fn posted(&mut self) -> Option<&Posted> {
+        let n = self.nest.as_ref()?;
+        let tool = self.tool()?.clone();
+        let key = format!("{}|{}|{:?}|{:?}", self.nest_rev, self.sheet, tool, self.post);
+        if self.posted.as_ref().is_none_or(|p| p.key != key) {
+            let cuts = logic::toolpath(&self.parts, n, self.sheet, &self.post);
+            let code = logic::gcode(&self.parts, n, self.sheet, &tool, &self.post);
+            self.posted = Some(Posted { key, cuts, code });
+        }
+        self.posted.as_ref()
+    }
+    /// Length in the display unit, with its suffix.
+    fn len(&self, mm: f64) -> String {
+        if self.metric { format!("{mm:.1} mm") } else { format!("{:.2} in", mm / MM_PER_IN) }
+    }
+    #[allow(dead_code)]
+    fn feed(&self, mm_min: f64) -> String {
+        if self.metric { format!("{mm_min:.0} mm/min") } else { format!("{:.0} ipm", mm_min / MM_PER_IN) }
+    }
+}
+
+pub fn active(app: &SolveApp) -> bool {
+    app.ui.tab == TAB
+}
+
+/// Switch to the Plasma CAM workspace. Leaving it is entering Design or Render.
+pub fn enter(app: &mut SolveApp) -> Result<(), String> {
+    if app.session.active_sketch.is_some() || app.tool.is_some() || app.dialog.is_some() || app.file_load.busy() {
+        return Err(crate::i18n::tr("render.error_finish_operation").into());
+    }
+    if crate::render_workspace::active(app) {
+        crate::render_workspace::enter(app, false)?;
+    }
+    app.ui.tab = TAB.into();
+    app.viewport.hover = None;
+    app.cam_anim = None;
+    Ok(())
+}
+
+// --- Ribbon --------------------------------------------------------------------------------------
+
+struct Button {
+    id: &'static str,
+    label: String,
+    icon: &'static str,
+    on: bool,
+}
+
+fn button(id: &'static str, label: &str, icon: &'static str) -> Button {
+    Button { id, label: label.to_string(), icon, on: true }
+}
+
+fn groups(app: &SolveApp) -> Vec<(&'static str, Vec<Button>)> {
+    let s = &app.plasma_cam;
+    let has_parts = !s.parts.is_empty() && !s.busy();
+    let nested = s.nest.is_some();
+    let rotation = ROTATIONS.iter().find(|(a, _)| (*a - s.rotation_step).abs() < 0.1).map_or("Rotate 90°", |r| r.1);
+    let mut out = vec![(
+        "Parts",
+        vec![
+            button("import", "Import DXF", "dxf"),
+            button("samples", "Sample Parts", "library"),
+            Button { on: has_parts, ..button("clear", "Clear Parts", "delete") },
+        ],
+    )];
+    let sheets = vec![Button { on: nested, ..button("prev", "Previous", "reverse_normal") }, Button { on: nested, ..button("next", "Next", "play") }];
+    match s.page {
+        Page::Setup => {
+            out.push(("Tools", vec![button("import_tools", "Import Tools", "import"), button("export_materials", "QtPlasmaC Materials", "export")]));
+            out.push(("Units", vec![button("units", if s.metric { "Inches" } else { "Millimetres" }, "dimension")]));
+            out.push(("Nest", vec![Button { on: has_parts, ..button("nest", "Nest Parts", "pattern_rect") }]));
+        }
+        Page::Nest => {
+            out.push((
+                "Nest",
+                vec![
+                    Button { on: has_parts, ..button("nest", "Nest Parts", "pattern_rect") },
+                    button("rotate", rotation, "pattern_circ"),
+                    button("pip", if s.part_in_part { "Part in Part On" } else { "Part in Part Off" }, "combine"),
+                    Button { on: nested, ..button("unnest", "Clear Nest", "revert") },
+                ],
+            ));
+            out.push(("Sheets", sheets));
+        }
+        Page::Toolpath => {
+            out.push(("Toolpath", vec![Button { on: has_parts, ..button("generate", "Generate", "path") }]));
+            out.push((
+                "Post",
+                vec![
+                    Button { on: nested, ..button("post", "Post G-code", "export") },
+                    Button { on: nested, ..button("copy_gcode", "Copy G-code", "copy") },
+                ],
+            ));
+            out.push(("Sheets", sheets));
+        }
+        Page::Quote => {
+            out.push((
+                "Quote",
+                vec![
+                    Button { on: has_parts, ..button("copy_quote", "Copy Quote", "copy") },
+                    Button { on: has_parts, ..button("nest", "Nest for Sheets", "pattern_rect") },
+                ],
+            ));
+        }
+    }
+    out
+}
+
+/// The ribbon card's contents: this workspace's tabs, then its command groups.
+pub fn ribbon(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
+    let t = Tokens::get();
+    let accent = crate::theme::TabAccent::for_tab(&t, "MODEL");
+    let inset = 4.0;
+    let row_h = crate::toolbar::TAB_ROW_HEIGHT;
+    let mut x = r.left() + inset;
+    for page in Page::ALL {
+        let label = crate::i18n::tr_label(page.label());
+        let w = ui.painter().layout_no_wrap(label.to_string(), crate::fonts::semibold(t.font_button), t.text).size().x + 24.0;
+        let tr = Rect::from_min_size(pos2(x, r.top() + inset), vec2(w, row_h - 2.0 * inset));
+        let resp = ui.interact(tr, ui.id().with(("plasma_tab", page.label())), Sense::click());
+        let active = app.plasma_cam.page == page;
+        let (fill, ink) = if active {
+            (accent.soft, accent.ink)
+        } else if resp.hovered() {
+            (t.hover, t.text)
+        } else {
+            (Color32::TRANSPARENT, t.text)
+        };
+        ui.painter().rect_filled(tr, t.control_radius.saturating_sub(1), fill);
+        ui.painter().text(
+            tr.center(),
+            Align2::CENTER_CENTER,
+            label,
+            if active { crate::fonts::semibold(t.font_button) } else { FontId::proportional(t.font_button) },
+            ink,
+        );
+        crate::scenario::publish_target(&format!("plasma:tab:{}", page.label().to_lowercase()), tr);
+        if resp.clicked() {
+            app.plasma_cam.page = page;
+        }
+        x += w + 2.0;
+    }
+    let top = r.top() + row_h;
+    let bottom = top + crate::toolbar::GROUP_HEIGHT - 2.0;
+    let mut x = r.left() + inset;
+    let mut clicked = None;
+    for (gi, (caption, buttons)) in groups(app).into_iter().enumerate() {
+        if gi > 0 {
+            ui.painter().line_segment([pos2(x, top + 8.0), pos2(x, bottom - 6.0)], Stroke::new(1.0, t.border));
+            x += 4.0;
+        }
+        let start = x;
+        for b in &buttons {
+            let label = crate::i18n::tr_label(&b.label);
+            let w = (ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(t.font_button), t.text).size().x + 14.0).clamp(58.0, 120.0);
+            let br = Rect::from_min_size(pos2(x, top + 3.0), vec2(w, 60.0));
+            let resp = ui.interact(br, ui.id().with(("plasma_button", b.id)), if b.on { Sense::click() } else { Sense::hover() });
+            if b.on && resp.hovered() {
+                ui.painter().rect_filled(br, t.control_radius, t.hover);
+            }
+            crate::icons::paint_icon(
+                ui.painter(),
+                Rect::from_center_size(pos2(br.center().x, br.top() + 16.0), vec2(28.0, 28.0)),
+                b.icon,
+                if b.on { 1.0 } else { 0.35 },
+            );
+            ui.painter().text(
+                pos2(br.center().x, br.top() + 40.0),
+                Align2::CENTER_CENTER,
+                label,
+                FontId::proportional(t.font_button),
+                if b.on { t.text } else { t.text_dim },
+            );
+            crate::scenario::publish_target(&format!("plasma:{}", b.id), br);
+            if b.on && resp.clicked() {
+                clicked = Some(b.id);
+            }
+            x += w + 3.0;
+        }
+        ui.painter().text(
+            pos2((start + x) / 2.0, bottom - 10.0),
+            Align2::CENTER_CENTER,
+            crate::i18n::tr_label(caption),
+            FontId::proportional(t.font_small),
+            t.text_dim,
+        );
+        x += 4.0;
+    }
+    if let Some(id) = clicked {
+        act(app, ui.ctx(), id);
+    }
+}
+
+fn act(app: &mut SolveApp, ctx: &egui::Context, id: &str) {
+    let s = &mut app.plasma_cam;
+    match id {
+        "samples" => {
+            for p in logic::sample_parts() {
+                s.add_part(p);
+            }
+            s.message = Some(("Added six sample parts.".into(), false));
+        }
+        "clear" => s.clear(),
+        "nest" => {
+            s.run_nest();
+            if s.page == Page::Setup {
+                s.page = Page::Nest;
+            }
+        }
+        "generate" => {
+            if s.nest.is_none() && !s.busy() {
+                s.run_nest();
+            }
+        }
+        "unnest" => s.set_nest(None),
+        "rotate" => {
+            let i = ROTATIONS.iter().position(|(a, _)| (*a - s.rotation_step).abs() < 0.1).unwrap_or(2);
+            s.rotation_step = ROTATIONS.get((i + 1) % ROTATIONS.len()).map_or(90.0, |r| r.0);
+            s.set_nest(None);
+        }
+        "pip" => {
+            s.part_in_part = !s.part_in_part;
+            s.set_nest(None);
+        }
+        "units" => s.metric = !s.metric,
+        "prev" => s.sheet = s.sheet.saturating_sub(1),
+        "next" => {
+            let n = s.nest.as_ref().map_or(1, |n| n.sheets.max(1));
+            s.sheet = (s.sheet + 1).min(n - 1);
+        }
+        "copy_quote" => {
+            ctx.copy_text(quote_text(s));
+            s.message = Some(("Quote copied to the clipboard.".into(), false));
+        }
+        "copy_gcode" => {
+            let sheet = s.sheet;
+            if let Some(code) = s.posted().map(|p| p.code.clone()) {
+                ctx.copy_text(code);
+                s.message = Some((format!("G-code for sheet {} copied.", sheet + 1), false));
+            }
+        }
+        "post" => post(app),
+        "import" => import(app),
+        "import_tools" => import_tools(app),
+        "export_materials" => export_materials(app),
+        _ => {}
+    }
+}
+
+fn file_name(path: &str) -> String {
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+}
+
+fn import(app: &mut SolveApp) {
+    app.pick_open_for(&["dxf"], |app, path| {
+        let Some(path) = path else { return };
+        let name = file_name(&path);
+        let result = solidcraft_engine::io::vfs::read_to_string(&path, solidcraft_engine::io::MAX_DRAWING_BYTES)
+            .map_err(|e| format!("{name}: {e}"))
+            .and_then(|text| logic::part_from_dxf(&name, &text));
+        let s = &mut app.plasma_cam;
+        match result {
+            Ok(part) => {
+                s.message = Some(if part.open_chains > 0 {
+                    (format!("{name}: {} open outline(s) skipped; close them in your CAD.", part.open_chains), true)
+                } else {
+                    (format!("Imported {name}."), false)
+                });
+                s.add_part(part);
+                s.selected = Some(s.parts.len() - 1);
+            }
+            Err(e) => s.message = Some((e, true)),
+        }
+    });
+}
+
+fn import_tools(app: &mut SolveApp) {
+    app.pick_open_for(&["tools"], |app, path| {
+        let Some(path) = path else { return };
+        let name = file_name(&path);
+        let s = &mut app.plasma_cam;
+        match solidcraft_engine::io::vfs::read_to_string(&path, 16 << 20) {
+            Ok(text) => {
+                let tools = logic::parse_tools(&text);
+                if tools.is_empty() {
+                    s.message = Some((format!("{name}: no plasma tools found."), true));
+                } else {
+                    s.message = Some((format!("Loaded {} tools from {name}.", tools.len()), false));
+                    s.tools = tools;
+                    s.tool = 0;
+                    s.posted = None;
+                }
+            }
+            Err(e) => s.message = Some((format!("{name}: {e}"), true)),
+        }
+    });
+}
+
+fn export_materials(app: &mut SolveApp) {
+    let text = logic::qtplasmac_materials(&app.plasma_cam.tools, app.plasma_cam.post.inch);
+    app.pick_save("machine_material.cfg", &["cfg"], move |app, path| {
+        let Some(path) = path else { return };
+        app.plasma_cam.message = Some(match solidcraft_engine::io::vfs::write(&path, text.as_bytes()) {
+            Ok(()) => (format!("Saved {path}"), false),
+            Err(e) => (format!("Could not save materials: {e}"), true),
+        });
+    });
+}
+
+fn post(app: &mut SolveApp) {
+    let sheet = app.plasma_cam.sheet;
+    let Some(text) = app.plasma_cam.posted().map(|p| p.code.clone()) else { return };
+    let name = format!("{}-sheet{}.ngc", app.session.doc.name, sheet + 1);
+    app.pick_save(&name, &["ngc", "nc", "tap"], move |app, path| {
+        let Some(path) = path else { return };
+        app.plasma_cam.message = Some(match solidcraft_engine::io::vfs::write(&path, text.as_bytes()) {
+            Ok(()) => (format!("Saved {path}"), false),
+            Err(e) => (format!("Could not save G-code: {e}"), true),
+        });
+    });
+}
+
+fn sheets_area(s: &State) -> Option<f64> {
+    s.nest.as_ref().map(|n| n.sheets as f64 * s.settings().sheet_w * s.settings().sheet_h)
+}
+
+fn quote_text(s: &State) -> String {
+    use std::fmt::Write as _;
+    let Some(tool) = s.tool() else { return String::new() };
+    let q = logic::quote(&s.parts, tool, &s.pricing, sheets_area(s));
+    let mut out = format!("Plasma cutting quote - {} ({})\n", tool.name, tool.metal.label());
+    for l in &q.lines {
+        let _ = writeln!(out, "{:<28} {:>4} x ${:>9.2} = ${:>10.2}", l.name, l.qty, l.each, l.total);
+    }
+    let _ = writeln!(out, "Total: ${:.2}", q.total);
+    out
+}
+
+// --- Page ----------------------------------------------------------------------------------------
+
+/// The workspace page, in place of the 3D viewport.
+pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    app.plasma_cam.poll(ui.ctx());
+    let mut full = ui.max_rect();
+    // Floating layout draws the page under the cards; start below them.
+    let cards_bottom = app.shell.cards.iter().map(|c| c.bottom()).fold(full.top(), f32::max);
+    if cards_bottom < full.bottom() - 100.0 {
+        full.min.y = cards_bottom;
+    }
+    ui.painter().rect_filled(ui.max_rect(), 0, t.viewport_bottom);
+    let gap = t.space_8;
+    let area = full.shrink(gap);
+    let left = Rect::from_min_size(area.min, vec2(300.0_f32.min(area.width() * 0.3), area.height()));
+    let right_w = 360.0_f32.min(area.width() * 0.3);
+    let right = Rect::from_min_max(pos2(area.right() - right_w, area.top()), area.max);
+    let centre = Rect::from_min_max(pos2(left.right() + gap, area.top()), pos2(right.left() - gap, area.bottom()));
+    card(ui, left);
+    card(ui, right);
+    parts_panel(app, ui, left.shrink(t.space_12));
+    match app.plasma_cam.page {
+        Page::Setup => tools_panel(app, ui, right.shrink(t.space_12)),
+        Page::Nest => nest_panel(app, ui, right.shrink(t.space_12)),
+        Page::Toolpath => toolpath_panel(app, ui, right.shrink(t.space_12)),
+        Page::Quote => quote_panel(app, ui, right.shrink(t.space_12)),
+    }
+    sheet_canvas(app, ui, centre);
+}
+
+fn card(ui: &egui::Ui, r: Rect) {
+    let t = Tokens::get();
+    ui.painter().rect(r, t.radius_lg, t.panel, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+}
+
+fn child(ui: &mut egui::Ui, r: Rect, salt: &str) -> egui::Ui {
+    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(r).id_salt(salt).layout(egui::Layout::top_down(egui::Align::Min)));
+    c.set_clip_rect(r.expand(2.0));
+    c
+}
+
+fn heading(ui: &mut egui::Ui, text: &str, detail: &str) {
+    let t = Tokens::get();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(crate::i18n::tr_label(text).to_uppercase()).size(t.font_small).semibold().color(t.text_dim));
+        if !detail.is_empty() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(detail).size(t.font_small).color(t.text_dim));
+            });
+        }
+    });
+    ui.add_space(t.space_4);
+}
+
+fn note(ui: &mut egui::Ui, text: &str) {
+    let t = Tokens::get();
+    ui.label(egui::RichText::new(crate::i18n::tr_label(text)).size(t.font_small).color(t.text_dim));
+}
+
+fn stat(ui: &mut egui::Ui, label: &str, value: String) {
+    let t = Tokens::get();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(crate::i18n::tr_label(label)).size(t.font_body).color(t.text_dim));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(value).size(t.font_body).color(t.text));
+        });
+    });
+}
+
+fn num(ui: &mut egui::Ui, label: &str, value: &mut f64, range: std::ops::RangeInclusive<f64>, speed: f64, suffix: &str) -> bool {
+    crate::ui_kit::row(ui, label, |ui| crate::ui_kit::number_field(ui, value, range, speed, suffix).changed())
+}
+
+/// A length field shown in the display unit and stored in `k`-scaled storage units (`k` = display per stored).
+fn scaled(ui: &mut egui::Ui, label: &str, value: &mut f64, k: f64, max: f64, speed: f64, suffix: &str) -> bool {
+    let mut d = *value * k;
+    if num(ui, label, &mut d, 0.0..=max * k, speed * k, suffix) {
+        *value = d / k;
+        return true;
+    }
+    false
+}
+
+fn parts_panel(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
+    let t = Tokens::get();
+    let mut ui = child(ui, r, "plasma_parts");
+    let s = &mut app.plasma_cam;
+    let total: u32 = s.parts.iter().map(|p| p.qty).sum();
+    heading(&mut ui, "Parts", &format!("{} files · {total} pcs", s.parts.len()));
+    let list_h = (r.height() - 290.0).max(120.0);
+    let mut remove = None;
+    let mut changed = false;
+    egui::ScrollArea::vertical().id_salt("plasma_part_rows").max_height(list_h).auto_shrink([false, false]).show(&mut ui, |ui| {
+        if s.parts.is_empty() {
+            ui.add_space(t.space_24);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new(crate::i18n::tr_label("No parts yet")).size(t.font_heading).color(t.text));
+                ui.label(egui::RichText::new(crate::i18n::tr_label("Import DXF files or add the sample parts.")).size(t.font_body).color(t.text_dim));
+            });
+        }
+        for i in 0..s.parts.len() {
+            let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 52.0), Sense::click());
+            let sel = s.selected == Some(i);
+            if sel {
+                ui.painter().rect_filled(rr, t.control_radius, t.accent_soft);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(rr, t.control_radius, t.hover);
+            }
+            if resp.clicked() {
+                s.selected = if sel { None } else { Some(i) };
+            }
+            let colour = s.colour(i);
+            let thumb = Rect::from_min_size(rr.min + vec2(4.0, 4.0), vec2(44.0, 44.0));
+            ui.painter().rect_filled(thumb, t.radius_md, t.panel_header);
+            let metric = s.metric;
+            if let (Some(p), Some(tr)) = (s.parts.get(i), s.tris.get(i)) {
+                let k = (thumb.width() - 8.0) as f64 / p.width.max(p.height).max(1e-6);
+                let off = thumb.center() - vec2((p.width * k) as f32 / 2.0, -(p.height * k) as f32 / 2.0);
+                let map = |q: [f64; 2]| pos2(off.x + (q[0] * k) as f32, off.y - (q[1] * k) as f32);
+                paint_part(ui.painter(), &p.contours, tr, &map, colour, t.panel_header, 1.0);
+            }
+            let Some(p) = s.parts.get_mut(i) else { continue };
+            let name = ui.painter().layout(p.name.clone(), FontId::proportional(t.font_body), t.text, (rr.width() - 160.0).max(20.0));
+            ui.painter().galley(pos2(thumb.right() + 10.0, rr.top() + 8.0), name, t.text);
+            let size = if metric {
+                format!("{:.1} × {:.1} mm", p.width, p.height)
+            } else {
+                format!("{:.2} × {:.2} in", p.width / MM_PER_IN, p.height / MM_PER_IN)
+            };
+            ui.painter().text(pos2(thumb.right() + 10.0, rr.top() + 36.0), Align2::LEFT_CENTER, size, FontId::proportional(t.font_small), t.text_dim);
+            let qr = Rect::from_min_size(pos2(rr.right() - 92.0, rr.center().y - 12.0), vec2(64.0, 24.0));
+            let mut q = p.qty;
+            let mut qui = ui.new_child(egui::UiBuilder::new().max_rect(qr).id_salt(("plasma_qty", i)));
+            if qui.add(egui::DragValue::new(&mut q).range(0..=9999).prefix("× ")).changed() {
+                p.qty = q;
+                changed = true;
+            }
+            let xr = Rect::from_center_size(pos2(rr.right() - 14.0, rr.center().y), vec2(20.0, 20.0));
+            let xresp = ui.interact(xr, ui.id().with(("plasma_rm", i)), Sense::click());
+            crate::icons::paint_ink(ui.painter(), xr.shrink(3.0), "close", if xresp.hovered() { t.error } else { t.text_dim });
+            if xresp.clicked() {
+                remove = Some(i);
+            }
+        }
+    });
+    if let Some(i) = remove {
+        s.remove(i);
+    }
+    if changed {
+        s.set_nest(None);
+    }
+    ui.add_space(t.space_8);
+    ui.separator();
+    ui.add_space(t.space_8);
+    let tool = s.tool().map(|t| format!("{} · {}", t.metal.label(), t.name)).unwrap_or_default();
+    heading(&mut ui, "Sheet", &tool);
+    let (unit, k) = if s.metric { (" mm", MM_PER_IN) } else { (" in", 1.0) };
+    let mut c = false;
+    c |= scaled(&mut ui, "Sheet X", &mut s.sheet_w_in, k, 480.0, 0.05, unit);
+    c |= scaled(&mut ui, "Sheet Y", &mut s.sheet_h_in, k, 480.0, 0.05, unit);
+    c |= scaled(&mut ui, "Part spacing", &mut s.spacing_in, k, 4.0, 0.01, unit);
+    c |= scaled(&mut ui, "Edge margin", &mut s.margin_in, k, 12.0, 0.01, unit);
+    if c {
+        s.set_nest(None);
+    }
+}
+
+/// The tool library list, filtered; clicking a row picks the tool. Returns nothing; edits `s.tool`.
+fn tool_list(ui: &mut egui::Ui, s: &mut State, height: f32, salt: &str, header: bool) {
+    let t = Tokens::get();
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+        for f in Filter::ALL {
+            if ui.add(egui::Button::new(egui::RichText::new(crate::i18n::tr_label(f.label())).size(t.font_small)).selected(s.filter == f)).clicked() {
+                s.filter = f;
+                s.reveal_tool = true;
+            }
+        }
+    });
+    ui.add_space(t.space_4);
+    if header {
+        let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
+        let font = FontId::proportional(t.font_small);
+        ui.painter().text(pos2(hr.left() + 32.0, hr.center().y), Align2::LEFT_CENTER, crate::i18n::tr_label("Name"), font.clone(), t.text_dim);
+        ui.painter().text(
+            pos2(hr.right() - 56.0, hr.center().y),
+            Align2::RIGHT_CENTER,
+            crate::i18n::tr_label(if s.metric { "mm/min" } else { "IPM" }),
+            font.clone(),
+            t.text_dim,
+        );
+        ui.painter().text(pos2(hr.right() - 6.0, hr.center().y), Align2::RIGHT_CENTER, crate::i18n::tr_label("Kerf"), font, t.text_dim);
+    }
+    let reveal = std::mem::take(&mut s.reveal_tool);
+    let filter = s.filter;
+    let metric = s.metric;
+    egui::ScrollArea::vertical().id_salt(salt).max_height(height).auto_shrink([false, false]).show(ui, |ui| {
+        for (i, tool) in s.tools.iter().enumerate().filter(|(_, tl)| filter.keeps(tl)) {
+            let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+            let sel = s.tool == i;
+            if sel {
+                ui.painter().rect_filled(rr, t.control_radius, t.accent_soft);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(rr, t.control_radius, t.hover);
+            }
+            let ink = if sel { t.selected_ink } else { t.text };
+            ui.painter().text(
+                pos2(rr.left() + 6.0, rr.center().y),
+                Align2::LEFT_CENTER,
+                format!("{}", tool.number),
+                FontId::proportional(t.font_small),
+                t.text_dim,
+            );
+            let name = ui.painter().layout(tool.name.clone(), FontId::proportional(t.font_body), ink, rr.width() - 140.0);
+            ui.painter().galley(pos2(rr.left() + 32.0, rr.center().y - name.size().y / 2.0), name, ink);
+            let feed = if metric { format!("{:.0}", tool.feed) } else { format!("{:.0}", tool.feed / MM_PER_IN) };
+            ui.painter().text(pos2(rr.right() - 56.0, rr.center().y), Align2::RIGHT_CENTER, feed, FontId::proportional(t.font_body), ink);
+            let kerf = if metric { format!("{:.2}", tool.kerf) } else { format!("{:.3}", tool.kerf / MM_PER_IN) };
+            ui.painter().text(pos2(rr.right() - 6.0, rr.center().y), Align2::RIGHT_CENTER, kerf, FontId::proportional(t.font_body), t.text_dim);
+            if sel && reveal {
+                ui.scroll_to_rect(rr, Some(egui::Align::Center));
+            }
+            if resp.clicked() {
+                s.tool = i;
+            }
+        }
+    });
+}
+
+fn tools_panel(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
+    let t = Tokens::get();
+    let mut ui = child(ui, r, "plasma_tools");
+    let s = &mut app.plasma_cam;
+    heading(&mut ui, "Tool library", &format!("{} tools · Powermax 65", s.tools.len()));
+    let list_h = (r.height() - 330.0).max(140.0);
+    tool_list(&mut ui, s, list_h, "plasma_tool_rows", true);
+    ui.add_space(t.space_8);
+    ui.separator();
+    ui.add_space(t.space_8);
+    let metric = s.metric;
+    let (unit, k) = if metric { (" mm", 1.0) } else { (" in", 1.0 / MM_PER_IN) };
+    let idx = s.tool;
+    let mut changed = false;
+    if let Some(tool) = s.tools.get_mut(idx) {
+        let thick = tool.thickness_in.map(|th| format!("{th:.4} in")).unwrap_or_else(|| "—".into());
+        heading(&mut ui, &format!("Tool {}", tool.number), &format!("{} · {thick}", tool.metal.label()));
+        changed |= scaled(&mut ui, "Feed rate", &mut tool.feed, k, 20_000.0, 1.0, if metric { " mm/min" } else { " ipm" });
+        changed |= scaled(&mut ui, "Kerf width", &mut tool.kerf, k, 20.0, 0.01, unit);
+        changed |= num(&mut ui, "Pierce delay", &mut tool.pierce_delay, 0.0..=120.0, 0.05, " s");
+        changed |= scaled(&mut ui, "Pierce height", &mut tool.pierce_height, k, 50.0, 0.01, unit);
+        changed |= scaled(&mut ui, "Cut height", &mut tool.cut_height, k, 50.0, 0.01, unit);
+        changed |= num(&mut ui, "Cut volts", &mut tool.volts, 0.0..=300.0, 0.5, " V");
+        changed |= num(&mut ui, "Wear per pierce", &mut tool.per_pierce, 0.0..=50.0, 0.01, " $");
+    }
+    if changed {
+        s.posted = None;
+    }
+}
+
+fn nest_panel(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
+    let t = Tokens::get();
+    let mut ui = child(ui, r, "plasma_nest");
+    let s = &mut app.plasma_cam;
+    heading(&mut ui, "Nest", "True shape");
+    let mut pip = s.part_in_part;
+    if crate::ui_kit::checkbox(&mut ui, "Nest small parts inside holes", &mut pip).changed() {
+        s.part_in_part = pip;
+        s.set_nest(None);
+    }
+    ui.add_space(t.space_4);
+    if s.busy() {
+        ui.add_space(t.space_8);
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(egui::RichText::new(crate::i18n::tr_label("Nesting parts…")).size(t.font_body).color(t.text));
+        });
+        return;
+    }
+    let settings = s.settings();
+    let Some(n) = s.nest.clone() else {
+        note(&mut ui, "Press Nest Parts to lay the parts out on sheets by their real outlines.");
+        return;
+    };
+    let total_area = n.sheets as f64 * settings.sheet_w * settings.sheet_h;
+    let used: f64 = n.placements.iter().filter_map(|p| s.parts.get(p.part)).map(Part::area).sum();
+    let tool = s.tool().cloned();
+    stat(&mut ui, "Sheets", format!("{}", n.sheets));
+    stat(&mut ui, "Parts placed", format!("{}", n.placements.len()));
+    if !n.unplaced.is_empty() || n.truncated > 0 {
+        stat(&mut ui, "Did not fit", format!("{}", n.unplaced.len() + n.truncated));
+    }
+    stat(&mut ui, "Overall utilisation", format!("{:.1} %", if total_area > 0.0 { used / total_area * 100.0 } else { 0.0 }));
+    if let Some(tool) = &tool
+        && let Some(th) = tool.thickness_in
+    {
+        stat(&mut ui, "Sheet steel", format!("{:.1} lb", total_area / (MM_PER_IN * MM_PER_IN) * th * tool.metal.density()));
+    }
+    stat(&mut ui, "Grid resolution", s.len(n.cell));
+    ui.add_space(t.space_8);
+    ui.separator();
+    ui.add_space(t.space_8);
+    heading(&mut ui, "Sheets", "");
+    egui::ScrollArea::vertical().id_salt("plasma_sheet_rows").auto_shrink([false, false]).show(&mut ui, |ui| {
+        for k in 0..n.sheets {
+            let u = logic::utilisation(&s.parts, &n, k, &settings);
+            let count = n.placements.iter().filter(|p| p.sheet == k).count();
+            let length = logic::used_length(&s.parts, &n, k);
+            let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
+            if s.sheet == k {
+                ui.painter().rect_filled(rr, t.control_radius, t.accent_soft);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(rr, t.control_radius, t.hover);
+            }
+            ui.painter().text(
+                pos2(rr.left() + 8.0, rr.top() + 12.0),
+                Align2::LEFT_CENTER,
+                format!("Sheet {}  ·  {count} parts  ·  uses {}", k + 1, s.len(length)),
+                FontId::proportional(t.font_body),
+                t.text,
+            );
+            let bar = Rect::from_min_size(pos2(rr.left() + 8.0, rr.top() + 26.0), vec2(rr.width() - 70.0, 5.0));
+            ui.painter().rect_filled(bar, 2, t.panel_header);
+            ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * u as f32, bar.height())), 2, t.accent);
+            ui.painter().text(
+                pos2(rr.right() - 8.0, rr.center().y),
+                Align2::RIGHT_CENTER,
+                format!("{:.0}%", u * 100.0),
+                FontId::proportional(t.font_body),
+                t.text_dim,
+            );
+            if resp.clicked() {
+                s.sheet = k;
+            }
+        }
+    });
+}
+
+fn toolpath_panel(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
+    let t = Tokens::get();
+    let mut ui = child(ui, r, "plasma_toolpath");
+    let s = &mut app.plasma_cam;
+    let Some(tool) = s.tool().cloned() else { return };
+    heading(&mut ui, "Toolpath", &format!("Tool {} · {}", tool.number, tool.name));
+    let (unit, k) = if s.metric { (" mm", 1.0) } else { (" in", 1.0 / MM_PER_IN) };
+    let mut p = s.post;
+    scaled(&mut ui, "Lead-in length", &mut p.lead_in, k, 50.0, 0.1, unit);
+    scaled(&mut ui, "Slow holes under", &mut p.small_hole, k, 500.0, 0.5, unit);
+    num(&mut ui, "Hole speed", &mut p.hole_speed_pct, 10.0..=100.0, 1.0, " %");
+    crate::ui_kit::checkbox(&mut ui, "Inch program (G20) - match the QtPlasmaC config", &mut p.inch);
+    crate::ui_kit::checkbox(&mut ui, "Select the QtPlasmaC material (M190)", &mut p.use_material);
+    crate::ui_kit::checkbox(&mut ui, "Kerf compensation in QtPlasmaC (G41.1)", &mut p.kerf_comp);
+    s.post = p;
+    if s.busy() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(egui::RichText::new(crate::i18n::tr_label("Nesting parts…")).size(t.font_body).color(t.text));
+        });
+        return;
+    }
+    if s.nest.is_none() {
+        note(&mut ui, "Press Generate to nest the parts and build the toolpath.");
+        return;
+    }
+    let overhead = s.pricing.overhead_s_per_pierce;
+    let metric = s.metric;
+    let len_fmt = |mm: f64| if metric { format!("{mm:.0} mm") } else { format!("{:.1} in", mm / MM_PER_IN) };
+    let Some(posted) = s.posted() else { return };
+    let cut: f64 = posted.cuts.iter().map(|c| c.contour.length()).sum();
+    let pierces = posted.cuts.len();
+    let feed = if tool.feed > 0.0 { tool.feed } else { 1000.0 };
+    let minutes = cut / feed + pierces as f64 * (tool.pierce_delay + overhead) / 60.0;
+    let arcs = posted.code.lines().filter(|l| l.starts_with("G2 ") || l.starts_with("G3 ")).count();
+    let lines = posted.code.lines().count();
+    let preview: String = posted.code.lines().take(80).collect::<Vec<_>>().join("\n");
+    ui.add_space(t.space_6);
+    stat(&mut ui, "Cut length", len_fmt(cut));
+    stat(&mut ui, "Pierces", format!("{pierces}"));
+    stat(&mut ui, "Run time", format!("{:.0} min {:02.0} s", minutes.floor(), (minutes.fract() * 60.0).floor()));
+    stat(&mut ui, "Arc moves (G2/G3)", format!("{arcs}"));
+    ui.add_space(t.space_6);
+    ui.separator();
+    ui.add_space(t.space_6);
+    heading(&mut ui, "G-code preview", &format!("{lines} lines"));
+    egui::ScrollArea::vertical().id_salt("plasma_gcode").auto_shrink([false, false]).show(&mut ui, |ui| {
+        ui.label(egui::RichText::new(preview).monospace().size(t.font_small).color(t.text));
+    });
+}
+
+fn quote_panel(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
+    let t = Tokens::get();
+    let mut ui = child(ui, r, "plasma_quote");
+    let s = &mut app.plasma_cam;
+    let tool_name = s.tool().map(|t| t.name.clone()).unwrap_or_default();
+    heading(&mut ui, "Quote", &tool_name);
+    tool_list(&mut ui, s, 120.0, "plasma_quote_tools", false);
+    ui.add_space(t.space_6);
+    let Some(tool) = s.tool().cloned() else { return };
+    let p = &mut s.pricing;
+    match tool.metal {
+        Metal::Stainless => num(&mut ui, "Stainless price", &mut p.stainless_per_lb, 0.0..=50.0, 0.01, " $/lb"),
+        Metal::Aluminum => num(&mut ui, "Aluminum price", &mut p.aluminum_per_lb, 0.0..=50.0, 0.01, " $/lb"),
+        Metal::Steel | Metal::Other => num(&mut ui, "Steel price", &mut p.steel_per_lb, 0.0..=50.0, 0.01, " $/lb"),
+    };
+    num(&mut ui, "Machine rate", &mut p.machine_per_hour, 0.0..=1000.0, 1.0, " $/hr");
+    num(&mut ui, "Setup fee", &mut p.setup, 0.0..=10000.0, 1.0, " $");
+    num(&mut ui, "Scrap allowance", &mut p.scrap_allowance_pct, 0.0..=200.0, 1.0, " %");
+    num(&mut ui, "Markup", &mut p.markup_pct, 0.0..=500.0, 1.0, " %");
+    let mut full = p.charge_full_sheets;
+    if crate::ui_kit::checkbox(&mut ui, "Charge full sheets (needs a nest)", &mut full).changed() {
+        p.charge_full_sheets = full;
+    }
+    if tool.thickness_in.is_none() {
+        note(&mut ui, "This tool's name has no thickness, so material is not priced.");
+    }
+    let q = logic::quote(&s.parts, &tool, &s.pricing, sheets_area(s));
+    ui.add_space(t.space_4);
+    ui.separator();
+    ui.add_space(t.space_4);
+    stat(&mut ui, "Cut length · pierces", format!("{:.1} in · {}", q.cut_in, q.pierces));
+    stat(&mut ui, "Machine time", format!("{:.1} min", q.minutes));
+    stat(&mut ui, "Part weight", format!("{:.1} lb", q.weight_lb));
+    stat(&mut ui, "Material", format!("$ {:.2}", q.material));
+    stat(&mut ui, "Machine + consumables", format!("$ {:.2}", q.machine + q.consumables));
+    stat(&mut ui, "Setup + markup", format!("$ {:.2}", q.setup + q.markup));
+    ui.add_space(t.space_4);
+    let (tr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
+    ui.painter().rect_filled(tr, t.control_radius, t.accent_soft);
+    ui.painter().text(
+        pos2(tr.left() + 10.0, tr.center().y),
+        Align2::LEFT_CENTER,
+        crate::i18n::tr_label("Total"),
+        crate::fonts::semibold(t.font_heading),
+        t.selected_ink,
+    );
+    ui.painter().text(
+        pos2(tr.right() - 10.0, tr.center().y),
+        Align2::RIGHT_CENTER,
+        format!("$ {:.2}", q.total),
+        crate::fonts::semibold(t.font_heading + 2.0),
+        t.selected_ink,
+    );
+    ui.add_space(t.space_6);
+    let colours: Vec<Color32> = (0..s.parts.len()).map(|i| s.colour(i)).collect();
+    egui::ScrollArea::vertical().id_salt("plasma_quote_lines").auto_shrink([false, false]).show(&mut ui, |ui| {
+        for (i, l) in q.lines.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                ui.painter().circle_filled(dot.center(), 4.0, colours.get(i).copied().unwrap_or(t.accent));
+                ui.label(egui::RichText::new(format!("{} × {}", l.qty, l.name)).size(t.font_small).color(t.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("$ {:.2}  ($ {:.2} ea)", l.total, l.each)).size(t.font_small).color(t.text_dim));
+                });
+            });
+        }
+    });
+}
+
+/// Contours shaded with their holes cut out, through `map` (mm → screen).
+fn paint_part(
+    painter: &egui::Painter,
+    contours: &[Contour],
+    tris: &[Vec<[usize; 3]>],
+    map: &dyn Fn([f64; 2]) -> egui::Pos2,
+    ink: Color32,
+    hole_fill: Color32,
+    width: f32,
+) {
+    let fill = ink.gamma_multiply(0.28);
+    for (ci, c) in contours.iter().enumerate() {
+        let mut mesh = egui::Mesh::default();
+        let colour = if ci == 0 { fill } else { hole_fill };
+        for q in &c.pts {
+            mesh.colored_vertex(map(*q), colour);
+        }
+        for tri in tris.get(ci).map(Vec::as_slice).unwrap_or(&[]) {
+            let [a, b, c] = *tri;
+            mesh.add_triangle(a as u32, b as u32, c as u32);
+        }
+        painter.add(Shape::mesh(mesh));
+    }
+    for c in contours {
+        painter.add(Shape::closed_line(c.pts.iter().map(|q| map(*q)).collect(), Stroke::new(width, ink)));
+    }
+}
+
+fn sheet_canvas(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
+    let t = Tokens::get();
+    let s = &mut app.plasma_cam;
+    let settings = s.settings();
+    let sheets = s.nest.as_ref().map_or(1, |n| n.sheets.max(1));
+    s.sheet = s.sheet.min(sheets - 1);
+    let head = Rect::from_min_size(r.min, vec2(r.width(), 34.0));
+    let title = if s.busy() {
+        "Nesting…".to_string()
+    } else if s.nest.is_some() {
+        format!("Sheet {} of {sheets}", s.sheet + 1)
+    } else {
+        "Sheet (not nested)".to_string()
+    };
+    ui.painter().text(pos2(head.left() + 4.0, head.center().y), Align2::LEFT_CENTER, title, crate::fonts::semibold(t.font_heading), t.text);
+    let tool = s.tool().map(|tl| tl.name.clone()).unwrap_or_default();
+    let dims = format!("{} × {}  ·  {tool}", s.len(settings.sheet_w), s.len(settings.sheet_h));
+    ui.painter().text(pos2(head.right() - 4.0, head.center().y), Align2::RIGHT_CENTER, dims, FontId::proportional(t.font_body), t.text_dim);
+    let foot = Rect::from_min_max(pos2(r.left(), r.bottom() - 28.0), r.max);
+    let canvas = Rect::from_min_max(pos2(r.left(), head.bottom()), pos2(r.right(), foot.top() - 4.0));
+    // Fit the sheet, long side across.
+    let landscape = canvas.width() >= canvas.height();
+    let (sw, sh) = (settings.sheet_w.max(1.0), settings.sheet_h.max(1.0));
+    let swap = landscape != (sw >= sh);
+    let (vw, vh) = if swap { (sh, sw) } else { (sw, sh) };
+    let k = ((canvas.width() - 40.0) as f64 / vw).min((canvas.height() - 40.0) as f64 / vh).max(1e-6);
+    let origin = pos2(canvas.center().x - (vw * k) as f32 / 2.0, canvas.center().y + (vh * k) as f32 / 2.0);
+    // Sheet x,y (mm) → screen; when swapped the sheet's length runs across from the left.
+    let map = move |q: [f64; 2]| {
+        let (x, y) = if swap { (q[1], sw - q[0]) } else { (q[0], q[1]) };
+        pos2(origin.x + (x * k) as f32, origin.y - (y * k) as f32)
+    };
+    let sheet_rect = Rect::from_two_pos(map([0.0, 0.0]), map([sw, sh]));
+    ui.painter().rect_filled(sheet_rect.translate(vec2(3.0, 4.0)), 2, t.overlay.gamma_multiply(0.25));
+    ui.painter().rect(sheet_rect, 2, t.panel, Stroke::new(1.0, t.border), egui::StrokeKind::Outside);
+    let m = settings.margin;
+    if m > 0.0 && 2.0 * m < sw.min(sh) {
+        let usable = Rect::from_two_pos(map([m, m]), map([sw - m, sh - m]));
+        for shape in Shape::dashed_line(
+            &[usable.left_top(), usable.right_top(), usable.right_bottom(), usable.left_bottom(), usable.left_top()],
+            Stroke::new(1.0, t.grid_major),
+            6.0,
+            4.0,
+        ) {
+            ui.painter().add(shape);
+        }
+    }
+    ui.painter().circle_filled(map([0.0, 0.0]), 3.0, t.axis_x);
+    let hover_pos = ui.input(|i| i.pointer.hover_pos());
+    let mut hovered: Option<String> = None;
+    let toolpath = s.page == Page::Toolpath;
+    let grey = t.text_dim;
+    if let Some(n) = s.nest.clone() {
+        for pl in n.placements.iter().filter(|p| p.sheet == s.sheet) {
+            let (Some(part), Some(tris)) = (s.parts.get(pl.part), s.tris.get(pl.part)) else { continue };
+            let placed: Vec<Contour> = part.contours.iter().map(|c| pl.contour(c)).collect();
+            let Some(outer) = placed.first() else { continue };
+            let (lo, hi) = outer.bounds();
+            let bbox = Rect::from_two_pos(map(lo), map(hi));
+            let is_hover = hover_pos.is_some_and(|p| bbox.contains(p) && !s.busy());
+            // Each drawing keeps its own colour while nesting; once the toolpath is up they turn grey.
+            let colour = if toolpath { grey } else { s.colour(pl.part) };
+            let ink = if s.selected == Some(pl.part) || is_hover { t.sel_edge } else { colour };
+            if is_hover {
+                hovered = Some(format!("{}  ·  {} × {}  ·  {:.0}°", part.name, s.len(part.width), s.len(part.height), pl.angle_deg));
+            }
+            paint_part(ui.painter(), &placed, tris, &map, ink, t.panel, if is_hover { 2.0 } else { 1.2 });
+        }
+        if toolpath && let Some(posted) = s.posted() {
+            let mut last = map([0.0, 0.0]);
+            for (i, cut) in posted.cuts.iter().enumerate() {
+                let start = map(cut.lead_start);
+                for shape in Shape::dashed_line(&[last, start], Stroke::new(1.0, t.text_dim.gamma_multiply(0.7)), 4.0, 3.0) {
+                    ui.painter().add(shape);
+                }
+                ui.painter().add(Shape::closed_line(cut.contour.pts.iter().map(|q| map(*q)).collect(), Stroke::new(1.6, t.accent)));
+                ui.painter().line_segment([start, map(cut.contour.start)], Stroke::new(2.0, t.warning));
+                ui.painter().circle_filled(start, 2.5, t.warning);
+                if !cut.hole || cut.contour.length() > 60.0 {
+                    let (lo, hi) = cut.contour.bounds();
+                    let c = map([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0]);
+                    if !cut.hole {
+                        ui.painter().text(c, Align2::CENTER_CENTER, format!("{}", i + 1), FontId::proportional(t.font_small), t.text_dim);
+                    }
+                }
+                last = map(cut.contour.start);
+            }
+        }
+    } else if s.busy() {
+        ui.painter().text(
+            sheet_rect.center(),
+            Align2::CENTER_CENTER,
+            crate::i18n::tr_label("Nesting parts…"),
+            FontId::proportional(t.font_heading),
+            t.text_dim,
+        );
+    } else if !s.parts.is_empty() {
+        ui.painter().text(
+            sheet_rect.center(),
+            Align2::CENTER_CENTER,
+            crate::i18n::tr_label("Press Nest Parts to lay out the parts"),
+            FontId::proportional(t.font_heading),
+            t.text_dim,
+        );
+    } else {
+        ui.painter().text(
+            sheet_rect.center(),
+            Align2::CENTER_CENTER,
+            crate::i18n::tr_label("Import DXF parts to begin"),
+            FontId::proportional(t.font_heading),
+            t.text_dim,
+        );
+    }
+    crate::scenario::publish_rect("plasma:sheet", sheet_rect);
+    let (text, err) = if let Some(h) = hovered {
+        (h, false)
+    } else if let Some((m, e)) = &s.message {
+        (m.clone(), *e)
+    } else {
+        (String::new(), false)
+    };
+    let mut right = String::new();
+    if let Some(n) = &s.nest {
+        let u = logic::utilisation(&s.parts, n, s.sheet, &settings);
+        let count = n.placements.iter().filter(|p| p.sheet == s.sheet).count();
+        right = format!("{count} parts  ·  utilisation {:.1}%", u * 100.0);
+    }
+    ui.painter().text(
+        pos2(foot.left() + 4.0, foot.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(t.font_body),
+        if err { t.warning } else { t.text_dim },
+    );
+    ui.painter().text(pos2(foot.right() - 4.0, foot.center().y), Align2::RIGHT_CENTER, right, FontId::proportional(t.font_body), t.text_dim);
+}

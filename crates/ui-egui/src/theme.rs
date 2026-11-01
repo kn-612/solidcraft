@@ -554,6 +554,28 @@ pub(crate) fn scoped_tokens(tokens: Tokens) -> impl Drop {
     restore
 }
 
+/// Plasma CAM: one colour per imported drawing, so different DXFs never share a colour on the sheet.
+/// Blue, green, yellow, orange, red, purple, then teal, pink, brown, cyan, lime and indigo.
+pub const PART_COLOURS: [Color32; 12] = [
+    Color32::from_rgb(0x2F, 0x6F, 0xDB),
+    Color32::from_rgb(0x2E, 0x9E, 0x4F),
+    Color32::from_rgb(0xD4, 0xA3, 0x00),
+    Color32::from_rgb(0xE8, 0x73, 0x0C),
+    Color32::from_rgb(0xD6, 0x3B, 0x3B),
+    Color32::from_rgb(0x8A, 0x4F, 0xD1),
+    Color32::from_rgb(0x15, 0x9A, 0x9C),
+    Color32::from_rgb(0xD2, 0x4C, 0x8F),
+    Color32::from_rgb(0x8B, 0x5A, 0x2B),
+    Color32::from_rgb(0x1F, 0xA8, 0xD8),
+    Color32::from_rgb(0x7D, 0xB5, 0x1E),
+    Color32::from_rgb(0x4B, 0x4F, 0xC4),
+];
+
+/// The colour of the `i`th drawing in the Plasma CAM parts list.
+pub fn part_colour(i: usize) -> Color32 {
+    PART_COLOURS.get(i % PART_COLOURS.len()).copied().unwrap_or(Color32::GRAY)
+}
+
 /// A tab's selection colours. This is deliberately separate from the global widget style:
 /// application chrome, checkboxes, status colours and dialog actions retain their own tokens.
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -1,0 +1,61 @@
+# Plasma CAM fork: build the Windows app on every push to the plasma-cam branch and publish it as the
+# "Plasma CAM - latest build" pre-release (a zip with solidcraft.exe, the Plasma CAM README and the licences).
+name: Plasma CAM Windows build
+
+on:
+  push:
+    branches: [plasma-cam]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: plasma-cam-windows
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: plasma-cam-windows-x64
+      - name: Plasma CAM tests
+        shell: pwsh
+        run: cargo test --release -p solidcraft-ui-egui --lib plasma_cam
+      - name: Build
+        shell: pwsh
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_DEBUG: "0"
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release --target x86_64-pc-windows-msvc -p solidcraft
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "SolidCraft-PlasmaCAM-Windows"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/solidcraft.exe $dir/
+          Copy-Item "packaging/plasma-cam/README.txt" "$dir/README - Plasma CAM.txt"
+          Copy-Item LICENSE-MIT, LICENSE-APACHE, NOTICE, THIRD-PARTY-LICENSES.txt $dir/
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip" -Force
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: SolidCraft-PlasmaCAM-Windows
+          path: SolidCraft-PlasmaCAM-Windows.zip
+          retention-days: 30
+      - name: Publish the latest build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "plasma-cam-latest"
+          gh release delete $tag --yes --cleanup-tag 2>$null
+          $notes = "Built from ${{ github.sha }} on the plasma-cam branch. Unzip and run solidcraft.exe (unsigned: SmartScreen > More info > Run anyway)."
+          gh release create $tag SolidCraft-PlasmaCAM-Windows.zip --target ${{ github.sha }} --prerelease --title "Plasma CAM - latest build" --notes $notes
