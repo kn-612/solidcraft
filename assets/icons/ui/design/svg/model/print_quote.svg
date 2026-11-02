@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Print quote</title>
+  <path d="M18 6L40 6L46 12L46 26L18 26Z" fill="#e2e8ef" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M24 13L36 13" fill="none" stroke="#6f879c" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M24 19L40 19" fill="none" stroke="#6f879c" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M12 24L52 24A5 5 0 0 1 57 29L57 46L7 46L7 29A5 5 0 0 1 12 24Z" fill="#b8c3cf" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <circle cx="49" cy="32" r="2.4" fill="#328bd3"/>
+  <path d="M17 38L47 38L47 58L17 58Z" fill="#e2e8ef" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M23 45L41 45" fill="none" stroke="#236ead" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M23 51L35 51" fill="none" stroke="#236ead" stroke-width="2.4" stroke-linecap="round"/>
+</svg>

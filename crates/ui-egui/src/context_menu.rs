@@ -421,7 +421,10 @@ pub fn items(app: &SolveApp, target: &Target) -> Vec<Item> {
                     .with(json!({"workspace":"render"}))
                     .key(if rendering { "current" } else { "" })
                     .on(app.session.active_sketch.is_none() && app.tool.is_none() && app.dialog.is_none() && !app.file_load.busy()),
-                act("ui.workspace.plasma", "Plasma CAM", "cam").with(json!({"workspace":"plasma"})).key(if plasma { "current" } else { "" }).on(idle),
+                act("ui.workspace.plasma", "Plasma Nest", "ws_plasma")
+                    .with(json!({"workspace":"plasma"}))
+                    .key(if plasma { "current" } else { "" })
+                    .on(idle),
             ];
             for (w, icon) in [("Animation", "ws_animate"), ("Simulation", ""), ("Manufacture", ""), ("Drawing", "ws_drawing")] {
                 v.push(act("ui.workspace", w, icon).key("coming later").on(false));

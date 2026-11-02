@@ -1414,7 +1414,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
             crate::ui_kit::StageBar::workspace(ui, ws, "ws_render", app.tr("ui.render"), app.tr("ui.ribbon_workspace"));
         } else {
             let plasma = crate::plasma_cam::active(app);
-            let workspace_icon = if plasma { "cam" } else { "ws_design" };
+            let workspace_icon = if plasma { "ws_plasma" } else { "ws_design" };
             icons::paint_icon(
                 &painter,
                 Rect::from_center_size(pos2(ws.center().x, ws.top() + if labels { 39.0 } else { 25.0 }), vec2(30.0, 30.0)),
@@ -1424,7 +1424,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
             ribbon_text(
                 ui,
                 pos2(ws.center().x, ws.top() + if labels { 69.0 } else { 50.0 }),
-                if plasma { app.tr_label("Plasma CAM") } else { app.tr("ui.design") },
+                if plasma { app.tr_label("Plasma Nest") } else { app.tr("ui.design") },
                 t.font_button,
                 t.text,
                 true,

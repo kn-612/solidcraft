@@ -1,4 +1,4 @@
-SolidCraft with Plasma CAM - test build for Windows 10 and 11
+SolidCraft with Plasma Nest - test build for Windows 10 and 11
 =============================================================
 
 Running it
@@ -8,7 +8,7 @@ Running it
    The build isn't code-signed. If Windows SmartScreen says "Windows protected your PC",
    click "More info", then "Run anyway".
 3. In SolidCraft, click the Workspace switcher (top-left, under the Design icon) and choose
-   Plasma CAM. Choosing Design takes you back to modelling; nothing in Design has changed.
+   Plasma Nest. Choosing Design takes you back to modelling; nothing in Design has changed.
 
 Quick test
 ----------
@@ -26,6 +26,26 @@ Toolpath   -> parts turn grey; blue = cut path with direction arrows, orange = l
               Simulate plays the torch along the program (play/pause, speed, drag the timeline).
               Post G-code saves a .ngc file for QtPlasmaC. Copy G-code puts it on the clipboard.
 Quote      -> pick a tool, set your $/lb, machine rate, setup fee and markup.
+
+Sheet view
+----------
+Scroll the mouse wheel to zoom (toward the cursor); drag with the middle button to pan; Fit sheet
+frames the whole sheet again. Hover a nested part to highlight it, then left-drag to move it by
+hand (Esc while dragging puts it back). A part that ends up closer than the part spacing to
+another part, or off the usable sheet, turns red with the parts it touches until you move it clear.
+
+Rotation (Nest tab): none, 180, 90, 45, 15 degrees, or Any (best fit), which tries several ways and
+keeps the layout that uses the fewest sheets and the least sheet length.
+Small Parts in Holes nests small parts inside the holes of larger ones.
+
+Customer quote (Quote tab)
+--------------------------
+Prices: $/lb by material, price per pierce, price per cut inch, machine rate, setup fee, scrap
+allowance, markup and sales tax. Set the machine rate to 0 to price only by pierces and inches.
+Fill in "Customer and job" and "Your business" (company, address, phone, email, website, logo,
+terms). Your business details and prices are saved for next time.
+Print Quote opens the quote page in your web browser: print it or save it as PDF.
+Save Quote saves the same page as an .html file.
 
 Sheet layout
 ------------
@@ -55,5 +75,5 @@ Please dry-run the first program (torch off) and cut a test part before trusting
 Known limits in this test build
 -------------------------------
 - Import DXF takes one file at a time.
-- Plasma CAM settings (parts, nest, prices) aren't saved with the design yet.
+- Plasma Nest settings (parts, nest, prices) aren't saved with the design yet.
 - Splines and ellipses in a DXF are cut as short straight segments; lines, arcs and circles are exact.

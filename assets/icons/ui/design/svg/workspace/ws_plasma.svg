@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Ws plasma</title>
+  <path d="M20 40L60 40L44 48L4 48Z" fill="#e2e8ef" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M4 48L44 48L44 54L4 54Z" fill="#b8c3cf" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M44 48L60 40L60 46L44 54Z" fill="#8e9faf" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M15 44L32 44" fill="none" stroke="#a45000" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M39 9C45 9 47 4 55 4" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M28 3L36 3A3 3 0 0 1 39 6L39 22L25 22L25 6A3 3 0 0 1 28 3Z" fill="#b9ddf8" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M25 22L39 22L35.5 30L28.5 30Z" fill="#328bd3" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 31L29.5 35L34 37.5L31 41L32 44" fill="none" stroke="#c06f00" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M33 57L37 62" fill="none" stroke="#c06f00" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M29 57L26 62" fill="none" stroke="#c06f00" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M31 57L31 62" fill="none" stroke="#a45000" stroke-width="2.2" stroke-linecap="round"/>
+</svg>

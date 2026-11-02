@@ -12,6 +12,9 @@ use crate::theme::Tokens;
 #[path = "plasma_cam_logic.rs"]
 pub(crate) mod logic;
 
+#[path = "plasma_cam_quote.rs"]
+pub(crate) mod quote;
+
 use logic::{Contour, Cut, Lead, MM_PER_IN, Metal, Motion, MoveKind, Nest, NestSettings, Part, PostSettings, Pricing, Side, Tool};
 
 /// `app.ui.tab` while the Plasma CAM workspace is showing.
@@ -64,7 +67,53 @@ impl Filter {
     }
 }
 
-const ROTATIONS: [(f64, &str); 5] = [(0.0, "No Rotation"), (180.0, "Rotate 180°"), (90.0, "Rotate 90°"), (45.0, "Rotate 45°"), (15.0, "Rotate 15°")];
+const ROTATIONS: [(f64, &str); 6] = [
+    (0.0, "No Rotation"),
+    (180.0, "Rotate 180°"),
+    (90.0, "Rotate 90°"),
+    (45.0, "Rotate 45°"),
+    (15.0, "Rotate 15°"),
+    (logic::BEST_FIT, "Any (best fit)"),
+];
+
+/// A part being moved by hand.
+#[derive(Clone, Copy, Debug)]
+struct Drag {
+    placement: usize,
+    /// Pointer at the grab, sheet mm.
+    grab: [f64; 2],
+    /// The placement's offset at the grab.
+    from: (f64, f64),
+}
+
+/// Sheet mm ↔ screen for the sheet view's top-down camera.
+#[derive(Clone, Copy, Debug)]
+struct SheetView {
+    scale: f64,
+    ox: f64,
+    oy: f64,
+}
+
+impl SheetView {
+    fn of(cam: &solidcraft_engine::render::Camera, rect: Rect) -> Self {
+        let scale = f64::from(rect.height()) / (2.0 * cam.half_height()).max(1e-9);
+        SheetView { scale, ox: f64::from(rect.center().x) - cam.target.x * scale, oy: f64::from(rect.center().y) + cam.target.y * scale }
+    }
+    fn map(&self, q: [f64; 2]) -> egui::Pos2 {
+        pos2((self.ox + q[0] * self.scale) as f32, (self.oy - q[1] * self.scale) as f32)
+    }
+    fn to_sheet(&self, p: egui::Pos2) -> [f64; 2] {
+        [(f64::from(p.x) - self.ox) / self.scale, (self.oy - f64::from(p.y)) / self.scale]
+    }
+}
+
+fn sheet_camera() -> solidcraft_engine::render::Camera {
+    let mut cam = solidcraft_engine::render::Camera::default();
+    cam.set_view(solidcraft_engine::render::StandardView::Top);
+    cam.fov = 0.0;
+    cam.up = solidcraft_engine::render::UpAxis::Z;
+    cam
+}
 
 /// The toolpath and G-code for one sheet, kept until something they depend on changes.
 struct Posted {
@@ -121,6 +170,17 @@ pub struct State {
     sim: Option<Sim>,
     pub metric: bool,
     pub message: Option<(String, bool)>,
+    /// The sheet view's camera (zoom and pan), framed on the sheet until the user zooms.
+    cam: solidcraft_engine::render::Camera,
+    fitted: bool,
+    view_key: Option<(u64, u64)>,
+    drag: Option<Drag>,
+    /// The last moved part, what it touches, and whether it left the sheet.
+    clash: Option<(usize, Vec<usize>, bool)>,
+    pub business: quote::Business,
+    pub customer: quote::Customer,
+    /// The saved business info and prices, to notice edits.
+    saved_json: String,
 }
 
 impl Default for State {
@@ -156,11 +216,56 @@ impl Default for State {
             sim: None,
             metric: false,
             message: None,
+            cam: sheet_camera(),
+            fitted: false,
+            view_key: None,
+            drag: None,
+            clash: None,
+            business: quote::Business::default(),
+            customer: quote::Customer::default(),
+            saved_json: String::new(),
         }
+        .with_saved()
     }
 }
 
 impl State {
+    /// Load the business info and shop prices kept from earlier sessions.
+    fn with_saved(mut self) -> Self {
+        let saved = quote::load();
+        self.business = saved.business.clone();
+        if let Some(p) = &saved.pricing {
+            p.apply(&mut self.pricing);
+        }
+        self.saved_json = self.saved_snapshot();
+        self
+    }
+    fn saved_snapshot(&self) -> String {
+        let saved = quote::Saved { business: self.business.clone(), pricing: Some(quote::SavedPricing::from(&self.pricing)) };
+        serde_json::to_string(&saved).unwrap_or_default()
+    }
+    /// Write the business info and prices when they changed.
+    fn autosave(&mut self) {
+        let now = self.saved_snapshot();
+        if now != self.saved_json {
+            let saved = quote::Saved { business: self.business.clone(), pricing: Some(quote::SavedPricing::from(&self.pricing)) };
+            if let Err(e) = quote::save(&saved) {
+                self.message = Some((format!("Could not save business info: {e}"), true));
+            }
+            self.saved_json = now;
+        }
+    }
+    /// Frame the whole sheet in `rect`.
+    fn fit(&mut self, rect: Rect) {
+        let (w, h) = (self.sheet_w_in.max(0.1) * MM_PER_IN, self.sheet_h_in.max(0.1) * MM_PER_IN);
+        let area = rect.shrink(24.0);
+        let scale = (f64::from(area.width().max(10.0)) / w).min(f64::from(area.height().max(10.0)) / h);
+        self.cam.target.x = w * 0.5;
+        self.cam.target.y = h * 0.5;
+        self.cam.target.z = 0.0;
+        self.cam.distance = f64::from(rect.height()) / (2.0 * scale) / 0.4;
+        self.fitted = true;
+    }
     fn settings(&self) -> NestSettings {
         NestSettings {
             sheet_w: self.sheet_w_in * MM_PER_IN,
@@ -190,6 +295,8 @@ impl State {
         self.nest_rev += 1;
         self.posted = None;
         self.sim = None;
+        self.drag = None;
+        self.clash = None;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.job = None;
@@ -381,7 +488,7 @@ fn groups(app: &SolveApp) -> Vec<(&'static str, Vec<Button>)> {
                 vec![
                     Button { on: has_parts, ..button("nest", "Nest Parts", "pattern_rect") },
                     button("rotate", rotation, "pattern_circ"),
-                    button("pip", if s.part_in_part { "Part in Part On" } else { "Part in Part Off" }, "combine"),
+                    Button { active: s.part_in_part, ..button("pip", "Small Parts in Holes", "part_in_part") },
                     Button { on: nested, ..button("unnest", "Clear Nest", "revert") },
                 ],
             ));
@@ -389,20 +496,6 @@ fn groups(app: &SolveApp) -> Vec<(&'static str, Vec<Button>)> {
         }
         Page::Toolpath => {
             out.push(("Toolpath", vec![Button { on: has_parts, ..button("generate", "Generate", "path") }]));
-            let any = !s.parts.is_empty();
-            let sel_side = s.selected.and_then(|i| s.parts.get(i)).map(|p| p.side);
-            let all_side = |side: Side| any && s.parts.iter().all(|p| p.side == side);
-            let on_side = |side: Side| if s.selected.is_some() { sel_side == Some(side) } else { all_side(side) };
-            out.push((
-                "Cut side",
-                vec![
-                    Button { on: any, active: on_side(Side::Outside), ..button("side_out", "Outside", "offset") },
-                    Button { on: any, active: on_side(Side::Inside), ..button("side_in", "Inside", "offset_face") },
-                    Button { on: any, active: on_side(Side::OnLine), ..button("side_on", "No Offset", "line") },
-                    Button { on: any, ..button("reverse", "Reverse Direction", "reverse") },
-                    Button { on: any && on_side(Side::OnLine), ..button("flip_lead", "Reverse Cut Side", "pattern_flip") },
-                ],
-            ));
             let simulating = s.sim.is_some();
             out.push((
                 "Simulate",
@@ -426,6 +519,13 @@ fn groups(app: &SolveApp) -> Vec<(&'static str, Vec<Button>)> {
             out.push(("Sheets", sheets));
         }
         Page::Quote => {
+            out.push((
+                "Customer quote",
+                vec![
+                    Button { on: has_parts, ..button("print_quote", "Print Quote", "print_quote") },
+                    Button { on: has_parts, ..button("save_quote", "Save Quote", "export") },
+                ],
+            ));
             out.push((
                 "Quote",
                 vec![
@@ -609,6 +709,8 @@ fn act(app: &mut SolveApp, ctx: &egui::Context, id: &str) {
             }
         }
         "post" => post(app),
+        "print_quote" => print_quote(app, ctx),
+        "save_quote" => save_quote(app),
         "import" => import(app),
         "import_tools" => import_tools(app),
         "export_materials" => export_materials(app),
@@ -967,7 +1069,7 @@ fn tool_list(ui: &mut egui::Ui, s: &mut State, height: f32, salt: &str, header: 
                 FontId::proportional(t.font_small),
                 t.text_dim,
             );
-            let name = ui.painter().layout(tool.name.clone(), FontId::proportional(t.font_body), ink, rr.width() - 140.0);
+            let name = one_line(ui, tool.name.clone(), FontId::proportional(t.font_body), ink, (rr.width() - 120.0).max(20.0));
             ui.painter().galley(pos2(rr.left() + 32.0, rr.center().y - name.size().y / 2.0), name, ink);
             let feed = if metric { format!("{:.0}", tool.feed) } else { format!("{:.0}", tool.feed / MM_PER_IN) };
             ui.painter().text(pos2(rr.right() - 56.0, rr.center().y), Align2::RIGHT_CENTER, feed, FontId::proportional(t.font_body), ink);
@@ -1019,7 +1121,7 @@ fn nest_panel(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
     let s = &mut app.plasma_cam;
     heading(&mut ui, "Nest", "True shape");
     let mut pip = s.part_in_part;
-    if crate::ui_kit::checkbox(&mut ui, "Nest small parts inside holes", &mut pip).changed() {
+    if crate::ui_kit::checkbox(&mut ui, "Small parts in holes", &mut pip).changed() {
         s.part_in_part = pip;
         s.set_nest(None);
     }
@@ -1223,72 +1325,222 @@ fn toolpath_panel(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
     });
 }
 
+/// A one-line text field in a form row.
+fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) -> bool {
+    crate::ui_kit::row(ui, label, |ui| {
+        let resp = ui.add(egui::TextEdit::singleline(value).hint_text(crate::i18n::tr_label(hint)).desired_width(ui.available_width()));
+        Tokens::get().input_bevel(ui, &resp);
+        resp.changed()
+    })
+}
+
+/// A labelled multi-line text box.
+fn text_box(ui: &mut egui::Ui, label: &str, value: &mut String, rows: usize, hint: &str) -> bool {
+    let t = Tokens::get();
+    ui.label(egui::RichText::new(crate::i18n::tr_label(label)).size(t.font_label).color(t.dialog_label));
+    let resp = ui.add(egui::TextEdit::multiline(value).desired_rows(rows).hint_text(crate::i18n::tr_label(hint)).desired_width(ui.available_width()));
+    t.input_bevel(ui, &resp);
+    ui.add_space(t.space_4);
+    resp.changed()
+}
+
 fn quote_panel(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
     let t = Tokens::get();
     let mut ui = child(ui, r, "plasma_quote");
+    let mut pick_logo = false;
     let s = &mut app.plasma_cam;
-    let tool_name = s.tool().map(|t| t.name.clone()).unwrap_or_default();
-    heading(&mut ui, "Quote", &tool_name);
-    tool_list(&mut ui, s, 120.0, "plasma_quote_tools", false);
-    ui.add_space(t.space_6);
-    let Some(tool) = s.tool().cloned() else { return };
-    let p = &mut s.pricing;
-    match tool.metal {
-        Metal::Stainless => num(&mut ui, "Stainless price", &mut p.stainless_per_lb, 0.0..=50.0, 0.01, " $/lb"),
-        Metal::Aluminum => num(&mut ui, "Aluminum price", &mut p.aluminum_per_lb, 0.0..=50.0, 0.01, " $/lb"),
-        Metal::Steel | Metal::Other => num(&mut ui, "Steel price", &mut p.steel_per_lb, 0.0..=50.0, 0.01, " $/lb"),
-    };
-    num(&mut ui, "Machine rate", &mut p.machine_per_hour, 0.0..=1000.0, 1.0, " $/hr");
-    num(&mut ui, "Setup fee", &mut p.setup, 0.0..=10000.0, 1.0, " $");
-    num(&mut ui, "Scrap allowance", &mut p.scrap_allowance_pct, 0.0..=200.0, 1.0, " %");
-    num(&mut ui, "Markup", &mut p.markup_pct, 0.0..=500.0, 1.0, " %");
-    let mut full = p.charge_full_sheets;
-    if crate::ui_kit::checkbox(&mut ui, "Charge full sheets (needs a nest)", &mut full).changed() {
-        p.charge_full_sheets = full;
-    }
-    if tool.thickness_in.is_none() {
-        note(&mut ui, "This tool's name has no thickness, so material is not priced.");
-    }
-    let q = logic::quote(&s.parts, &tool, &s.pricing, sheets_area(s));
-    ui.add_space(t.space_4);
-    ui.separator();
-    ui.add_space(t.space_4);
-    stat(&mut ui, "Cut length · pierces", format!("{:.1} in · {}", q.cut_in, q.pierces));
-    stat(&mut ui, "Machine time", format!("{:.1} min", q.minutes));
-    stat(&mut ui, "Part weight", format!("{:.1} lb", q.weight_lb));
-    stat(&mut ui, "Material", format!("$ {:.2}", q.material));
-    stat(&mut ui, "Machine + consumables", format!("$ {:.2}", q.machine + q.consumables));
-    stat(&mut ui, "Setup + markup", format!("$ {:.2}", q.setup + q.markup));
-    ui.add_space(t.space_4);
-    let (tr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
-    ui.painter().rect_filled(tr, t.control_radius, t.accent_soft);
-    ui.painter().text(
-        pos2(tr.left() + 10.0, tr.center().y),
-        Align2::LEFT_CENTER,
-        crate::i18n::tr_label("Total"),
-        crate::fonts::semibold(t.font_heading),
-        t.selected_ink,
-    );
-    ui.painter().text(
-        pos2(tr.right() - 10.0, tr.center().y),
-        Align2::RIGHT_CENTER,
-        format!("$ {:.2}", q.total),
-        crate::fonts::semibold(t.font_heading + 2.0),
-        t.selected_ink,
-    );
-    ui.add_space(t.space_6);
-    let colours: Vec<Color32> = (0..s.parts.len()).map(|i| s.colour(i)).collect();
-    egui::ScrollArea::vertical().id_salt("plasma_quote_lines").auto_shrink([false, false]).show(&mut ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("plasma_quote_scroll").auto_shrink([false, false]).show(&mut ui, |ui| {
+        ui.set_width(ui.available_width() - 6.0);
+        let tool_name = s.tool().map(|t| t.name.clone()).unwrap_or_default();
+        heading(ui, "Quote", &tool_name);
+        tool_list(ui, s, 120.0, "plasma_quote_tools", false);
+        ui.add_space(t.space_6);
+        let Some(tool) = s.tool().cloned() else { return };
+        let p = &mut s.pricing;
+        heading(ui, "Prices", "");
+        match tool.metal {
+            Metal::Stainless => num(ui, "Stainless price", &mut p.stainless_per_lb, 0.0..=50.0, 0.01, " $/lb"),
+            Metal::Aluminum => num(ui, "Aluminum price", &mut p.aluminum_per_lb, 0.0..=50.0, 0.01, " $/lb"),
+            Metal::Steel | Metal::Other => num(ui, "Steel price", &mut p.steel_per_lb, 0.0..=50.0, 0.01, " $/lb"),
+        };
+        num(ui, "Price per pierce", &mut p.per_pierce, 0.0..=100.0, 0.01, " $");
+        num(ui, "Price per cut inch", &mut p.per_inch, 0.0..=100.0, 0.005, " $/in");
+        num(ui, "Machine rate", &mut p.machine_per_hour, 0.0..=1000.0, 1.0, " $/hr");
+        num(ui, "Setup fee", &mut p.setup, 0.0..=10000.0, 1.0, " $");
+        num(ui, "Scrap allowance", &mut p.scrap_allowance_pct, 0.0..=200.0, 1.0, " %");
+        num(ui, "Markup", &mut p.markup_pct, 0.0..=500.0, 1.0, " %");
+        num(ui, "Sales tax", &mut p.tax_pct, 0.0..=50.0, 0.05, " %");
+        let mut full = p.charge_full_sheets;
+        if crate::ui_kit::checkbox(ui, "Charge full sheets (needs a nest)", &mut full).changed() {
+            p.charge_full_sheets = full;
+        }
+        note(ui, "Set the machine rate to 0 to price only by pierces and cut inches.");
+        if tool.thickness_in.is_none() {
+            note(ui, "This tool's name has no thickness, so material is not priced.");
+        }
+        let q = logic::quote(&s.parts, &tool, &s.pricing, sheets_area(s));
+        ui.add_space(t.space_4);
+        ui.separator();
+        ui.add_space(t.space_4);
+        stat(ui, "Cut length · pierces", format!("{:.1} in · {}", q.cut_in, q.pierces));
+        stat(ui, "Machine time", format!("{:.1} min", q.minutes));
+        stat(ui, "Part weight", format!("{:.1} lb", q.weight_lb));
+        stat(ui, "Material", format!("$ {:.2}", q.material));
+        if q.pierce_charge > 0.0 {
+            stat(ui, "Pierces", format!("$ {:.2}", q.pierce_charge));
+        }
+        if q.inch_charge > 0.0 {
+            stat(ui, "Cut inches", format!("$ {:.2}", q.inch_charge));
+        }
+        stat(ui, "Machine + consumables", format!("$ {:.2}", q.machine + q.consumables));
+        stat(ui, "Setup + markup", format!("$ {:.2}", q.setup + q.markup));
+        let tax = q.total * s.pricing.tax_pct.max(0.0) / 100.0;
+        if tax > 0.0 {
+            stat(ui, "Sales tax", format!("$ {tax:.2}"));
+        }
+        ui.add_space(t.space_4);
+        let (tr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
+        ui.painter().rect_filled(tr, t.control_radius, t.accent_soft);
+        ui.painter().text(
+            pos2(tr.left() + 10.0, tr.center().y),
+            Align2::LEFT_CENTER,
+            crate::i18n::tr_label("Total"),
+            crate::fonts::semibold(t.font_heading),
+            t.selected_ink,
+        );
+        ui.painter().text(
+            pos2(tr.right() - 10.0, tr.center().y),
+            Align2::RIGHT_CENTER,
+            format!("$ {:.2}", q.total + tax),
+            crate::fonts::semibold(t.font_heading + 2.0),
+            t.selected_ink,
+        );
+        ui.add_space(t.space_6);
         for (i, l) in q.lines.iter().enumerate() {
+            let colour = s.colour(i);
             ui.horizontal(|ui| {
                 let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-                ui.painter().circle_filled(dot.center(), 4.0, colours.get(i).copied().unwrap_or(t.accent));
+                ui.painter().circle_filled(dot.center(), 4.0, colour);
                 ui.label(egui::RichText::new(format!("{} × {}", l.qty, l.name)).size(t.font_small).color(t.text));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(format!("$ {:.2}  ($ {:.2} ea)", l.total, l.each)).size(t.font_small).color(t.text_dim));
                 });
             });
         }
+        ui.add_space(t.space_8);
+        ui.separator();
+        // The customer's quote page.
+        egui::CollapsingHeader::new(egui::RichText::new(crate::i18n::tr_label("Customer and job")).semibold())
+            .id_salt("plasma_quote_customer")
+            .default_open(true)
+            .show(ui, |ui| {
+                let c = &mut s.customer;
+                text_row(ui, "Customer", &mut c.name, "Company or name");
+                text_row(ui, "Contact", &mut c.contact, "Attention");
+                text_box(ui, "Customer address", &mut c.address, 2, "Street, city, state, ZIP");
+                text_row(ui, "Phone", &mut c.phone, "");
+                text_row(ui, "Email", &mut c.email, "");
+                text_row(ui, "Job name", &mut c.job_name, "");
+                text_row(ui, "Job / quote #", &mut c.job_number, "");
+                text_row(ui, "Customer PO", &mut c.po, "");
+                let mut days = c.valid_days;
+                crate::ui_kit::row(ui, "Valid for", |ui| ui.add(egui::DragValue::new(&mut days).range(1..=365).suffix(" days")));
+                c.valid_days = days;
+                text_box(ui, "Notes on this quote", &mut c.notes, 2, "Shown on the printed quote");
+            });
+        egui::CollapsingHeader::new(egui::RichText::new(crate::i18n::tr_label("Your business")).semibold())
+            .id_salt("plasma_quote_business")
+            .default_open(s.business.company.is_empty())
+            .show(ui, |ui| {
+                let b = &mut s.business;
+                text_row(ui, "Company", &mut b.company, "Your company name");
+                text_box(ui, "Address", &mut b.address, 2, "Street, city, state, ZIP");
+                text_row(ui, "Phone", &mut b.phone, "");
+                text_row(ui, "Email", &mut b.email, "");
+                text_row(ui, "Website", &mut b.website, "");
+                crate::ui_kit::row(ui, "Logo", |ui| {
+                    if ui.button(crate::i18n::tr_label(if b.logo.is_empty() { "Choose image…" } else { "Change…" })).clicked() {
+                        pick_logo = true;
+                    }
+                    if !b.logo.is_empty() {
+                        let name = b.logo.rsplit(['/', '\\']).next().unwrap_or(&b.logo).to_string();
+                        ui.label(egui::RichText::new(name).size(t.font_small).color(t.text_dim));
+                        if ui.small_button("×").on_hover_text(crate::i18n::tr_label("Remove the logo")).clicked() {
+                            b.logo.clear();
+                        }
+                    }
+                });
+                text_box(ui, "Terms", &mut b.terms, 3, "Payment terms, lead time, pickup or delivery…");
+                note(ui, "Your business details and prices are saved for next time.");
+            });
+    });
+    s.autosave();
+    if pick_logo {
+        app.pick_open_for(&["png", "jpg", "jpeg", "gif", "svg", "webp"], |app, path| {
+            if let Some(path) = path {
+                app.plasma_cam.business.logo = path;
+                app.plasma_cam.autosave();
+            }
+        });
+    }
+}
+
+/// The customer quote page for the current job.
+fn quote_page(s: &State) -> Option<(String, String)> {
+    let tool = s.tool()?;
+    let q = logic::quote(&s.parts, tool, &s.pricing, sheets_area(s));
+    let logo = if s.business.logo.is_empty() {
+        None
+    } else {
+        solidcraft_engine::io::vfs::read(&s.business.logo, 8 << 20).ok().and_then(|bytes| quote::logo_uri(&s.business.logo, &bytes))
+    };
+    let date = quote::today();
+    let page = quote::html(&s.business, &s.customer, tool, &q, s.pricing.tax_pct, logo.as_deref(), date);
+    let tag: String = if s.customer.job_number.trim().is_empty() {
+        format!("{}-{:02}-{:02}", date.0, date.1, date.2)
+    } else {
+        s.customer.job_number.trim().to_string()
+    };
+    let tag: String = tag.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
+    Some((format!("Quote-{tag}.html"), page))
+}
+
+/// Write the quote page and open it in the browser to print or save as PDF.
+fn print_quote(app: &mut SolveApp, ctx: &egui::Context) {
+    let s = &mut app.plasma_cam;
+    let Some((name, page)) = quote_page(s) else { return };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let Some(dir) = quote::quotes_dir() else {
+            s.message = Some(("No folder to write the quote to.".into(), true));
+            return;
+        };
+        let path = dir.join(&name);
+        let written = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, page.as_bytes()));
+        match written {
+            Ok(()) => {
+                let url = format!("file:///{}", path.to_string_lossy().replace('\\', "/").trim_start_matches('/'));
+                ctx.open_url(egui::OpenUrl::new_tab(url));
+                s.message = Some((format!("Opened {name} in your browser: print it or save it as PDF."), false));
+            }
+            Err(e) => s.message = Some((format!("Could not write the quote: {e}"), true)),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (ctx, name, page);
+        s.message = Some(("Use Save Quote in the browser version.".into(), true));
+    }
+}
+
+fn save_quote(app: &mut SolveApp) {
+    let Some((name, page)) = quote_page(&app.plasma_cam) else { return };
+    app.pick_save(&name, &["html"], move |app, path| {
+        let Some(path) = path else { return };
+        app.plasma_cam.message = Some(match solidcraft_engine::io::vfs::write(&path, page.as_bytes()) {
+            Ok(()) => (format!("Saved {path}"), false),
+            Err(e) => (format!("Could not save the quote: {e}"), true),
+        });
     });
 }
 
@@ -1322,11 +1574,115 @@ fn paint_part(
 
 fn sheet_canvas(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
     let t = Tokens::get();
+    let head = Rect::from_min_size(r.min, vec2(r.width(), 34.0));
+    let foot = Rect::from_min_max(pos2(r.left(), r.bottom() - 28.0), r.max);
+    let canvas = Rect::from_min_max(pos2(r.left(), head.bottom()), pos2(r.right(), foot.top() - 4.0));
+    // Frame the sheet when it changes size, or when asked.
+    {
+        let s = &mut app.plasma_cam;
+        let key = (s.sheet_w_in.to_bits(), s.sheet_h_in.to_bits());
+        if s.view_key != Some(key) {
+            s.view_key = Some(key);
+            s.fitted = false;
+        }
+        if !s.fitted {
+            s.fit(canvas);
+        }
+    }
+    // Picking and moving parts by hand comes before navigation, so a press on a part moves the part.
+    let resp = ui.interact(canvas, ui.id().with("plasma_sheet_canvas"), Sense::click_and_drag());
+    let (pointer, pressed, down, escape) =
+        ui.input(|i| (i.pointer.hover_pos(), i.pointer.primary_pressed(), i.pointer.primary_down(), i.key_pressed(egui::Key::Escape)));
+    let sim_bar = Rect::from_min_size(pos2(canvas.left(), canvas.bottom() - 52.0), vec2(canvas.width(), 52.0));
+    let over = pointer.filter(|p| canvas.contains(*p) && !crate::shell::covered(app, *p) && !(app.plasma_cam.sim.is_some() && sim_bar.contains(*p)));
+    let view = SheetView::of(&app.plasma_cam.cam, canvas);
+    let settings = app.plasma_cam.settings();
+    let under = {
+        let s = &app.plasma_cam;
+        let can_move = s.sim.is_none() && !s.busy();
+        match (&s.nest, over) {
+            (Some(n), Some(p)) if can_move => logic::placement_at(&s.parts, n, s.sheet, view.to_sheet(p)),
+            _ => None,
+        }
+    };
+    {
+        let s = &mut app.plasma_cam;
+        if pressed
+            && s.drag.is_none()
+            && let (Some(i), Some(p)) = (under, over)
+            && let Some(pl) = s.nest.as_ref().and_then(|n| n.placements.get(i))
+        {
+            s.drag = Some(Drag { placement: i, grab: view.to_sheet(p), from: (pl.tx, pl.ty) });
+        }
+        if let Some(d) = s.drag {
+            let restore = |s: &mut State, at: (f64, f64)| {
+                if let Some(pl) = s.nest.as_mut().and_then(|n| n.placements.get_mut(d.placement)) {
+                    pl.tx = at.0;
+                    pl.ty = at.1;
+                }
+            };
+            if escape {
+                restore(s, d.from);
+                s.drag = None;
+                s.clash = None;
+            } else {
+                if let Some(p) = pointer {
+                    let q = view.to_sheet(p);
+                    restore(s, (d.from.0 + q[0] - d.grab[0], d.from.1 + q[1] - d.grab[1]));
+                }
+                let (hits, off) = s.nest.as_ref().map(|n| logic::contacts(&s.parts, n, d.placement, &settings)).unwrap_or_default();
+                s.clash = (!hits.is_empty() || off).then_some((d.placement, hits, off));
+                if !down {
+                    // Dropped: the toolpath follows the new layout.
+                    s.drag = None;
+                    s.nest_rev += 1;
+                    s.posted = None;
+                    let name = s
+                        .nest
+                        .as_ref()
+                        .and_then(|n| n.placements.get(d.placement))
+                        .and_then(|pl| s.parts.get(pl.part))
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default();
+                    s.message = Some(match &s.clash {
+                        Some((_, _, off)) if *off => (format!("{name} is off the usable sheet: move it back inside the margin."), true),
+                        Some((_, hits, _)) => (format!("{name} touches {} other part(s): move it further away.", hits.len()), true),
+                        None => (format!("Moved {name}."), false),
+                    });
+                }
+            }
+        }
+    }
+    // A part left touching after a drop stays red until it, or what it touched, is moved clear.
+    {
+        let s = &mut app.plasma_cam;
+        if s.drag.is_none()
+            && let Some((i, _, _)) = s.clash
+            && let Some(n) = &s.nest
+        {
+            let (hits, off) = logic::contacts(&s.parts, n, i, &settings);
+            s.clash = (!hits.is_empty() || off).then_some((i, hits, off));
+        }
+    }
+    let holding = app.plasma_cam.drag.is_some();
+    // Zoom with the wheel and pan through SolidCraft's shared navigation (no orbit on a flat page).
+    if !holding && !(pressed && under.is_some()) {
+        let design = std::mem::replace(&mut app.cam, app.plasma_cam.cam);
+        let _ = crate::navigation::handle(app, ui, canvas, &resp, crate::navigation::NavCaps { orbit: false, pick: false });
+        app.plasma_cam.cam = std::mem::replace(&mut app.cam, design);
+        app.viewport.mouse = None;
+    }
+    if holding {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    } else if under.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    let view = SheetView::of(&app.plasma_cam.cam, canvas);
+    let map = move |q: [f64; 2]| view.map(q);
     let s = &mut app.plasma_cam;
-    let settings = s.settings();
     let sheets = s.nest.as_ref().map_or(1, |n| n.sheets.max(1));
     s.sheet = s.sheet.min(sheets - 1);
-    let head = Rect::from_min_size(r.min, vec2(r.width(), 34.0));
+    // Header.
     let title = if s.busy() {
         "Nesting…".to_string()
     } else if s.nest.is_some() {
@@ -1334,24 +1690,24 @@ fn sheet_canvas(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
     } else {
         "Sheet (not nested)".to_string()
     };
-    ui.painter().text(pos2(head.left() + 4.0, head.center().y), Align2::LEFT_CENTER, title, crate::fonts::semibold(t.font_heading), t.text);
+    let title_g = ui.painter().layout_no_wrap(title, crate::fonts::semibold(t.font_heading), t.text);
+    let title_w = title_g.size().x;
+    ui.painter().galley(pos2(head.left() + 4.0, head.center().y - title_g.size().y / 2.0), title_g, t.text);
+    let fit = ui.put(
+        Rect::from_min_size(pos2(head.left() + title_w + 18.0, head.center().y - 12.0), vec2(84.0, 24.0)),
+        egui::Button::new(crate::i18n::tr_label("Fit sheet")),
+    );
+    crate::scenario::publish_target("plasma:fit", fit.rect);
+    if fit.clicked() {
+        s.fitted = false;
+    }
     let tool = s.tool().map(|tl| tl.name.clone()).unwrap_or_default();
     let dims = format!("{} × {}  ·  {tool}", s.len(settings.sheet_w), s.len(settings.sheet_h));
     ui.painter().text(pos2(head.right() - 4.0, head.center().y), Align2::RIGHT_CENTER, dims, FontId::proportional(t.font_body), t.text_dim);
-    let foot = Rect::from_min_max(pos2(r.left(), r.bottom() - 28.0), r.max);
-    let canvas = Rect::from_min_max(pos2(r.left(), head.bottom()), pos2(r.right(), foot.top() - 4.0));
-    // Fit the sheet, long side across.
-    let landscape = canvas.width() >= canvas.height();
+    // Everything on the sheet stays inside the canvas when zoomed in.
+    let outer_clip = ui.clip_rect();
+    ui.set_clip_rect(canvas.intersect(outer_clip));
     let (sw, sh) = (settings.sheet_w.max(1.0), settings.sheet_h.max(1.0));
-    let swap = landscape != (sw >= sh);
-    let (vw, vh) = if swap { (sh, sw) } else { (sw, sh) };
-    let k = ((canvas.width() - 40.0) as f64 / vw).min((canvas.height() - 40.0) as f64 / vh).max(1e-6);
-    let origin = pos2(canvas.center().x - (vw * k) as f32 / 2.0, canvas.center().y + (vh * k) as f32 / 2.0);
-    // Sheet x,y (mm) → screen; when swapped the sheet's length runs across from the left.
-    let map = move |q: [f64; 2]| {
-        let (x, y) = if swap { (q[1], sw - q[0]) } else { (q[0], q[1]) };
-        pos2(origin.x + (x * k) as f32, origin.y - (y * k) as f32)
-    };
     let sheet_rect = Rect::from_two_pos(map([0.0, 0.0]), map([sw, sh]));
     ui.painter().rect_filled(sheet_rect.translate(vec2(3.0, 4.0)), 2, t.overlay.gamma_multiply(0.25));
     ui.painter().rect(sheet_rect, 2, t.panel, Stroke::new(1.0, t.border), egui::StrokeKind::Outside);
@@ -1368,27 +1724,42 @@ fn sheet_canvas(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
         }
     }
     ui.painter().circle_filled(map([0.0, 0.0]), 3.0, t.axis_x);
-    let hover_pos = ui.input(|i| i.pointer.hover_pos());
     let mut hovered: Option<String> = None;
     let toolpath = s.page == Page::Toolpath;
     let grey = t.text_dim;
+    let dragging = s.drag.map(|d| d.placement);
+    let red: Vec<usize> = match &s.clash {
+        Some((me, hits, _)) => std::iter::once(*me).chain(hits.iter().copied()).collect(),
+        None => Vec::new(),
+    };
     if let Some(n) = s.nest.clone() {
-        for pl in n.placements.iter().filter(|p| p.sheet == s.sheet) {
+        for (i, pl) in n.placements.iter().enumerate().filter(|(_, p)| p.sheet == s.sheet) {
             let (Some(part), Some(tris)) = (s.parts.get(pl.part), s.tris.get(pl.part)) else { continue };
             let placed: Vec<Contour> = part.contours.iter().map(|c| pl.contour(c)).collect();
-            let Some(outer) = placed.first() else { continue };
-            let (lo, hi) = outer.bounds();
-            let bbox = Rect::from_two_pos(map(lo), map(hi));
-            let is_hover = hover_pos.is_some_and(|p| bbox.contains(p) && !s.busy());
-            // Each drawing keeps its own colour while nesting; once the toolpath is up they turn grey.
-            let colour = if toolpath { grey } else { s.colour(pl.part) };
-            let ink = if s.selected == Some(pl.part) || is_hover { t.sel_edge } else { colour };
-            if is_hover {
-                hovered = Some(format!("{}  ·  {} × {}  ·  {:.0}°", part.name, s.len(part.width), s.len(part.height), pl.angle_deg));
+            let lit = dragging == Some(i) || (dragging.is_none() && under == Some(i));
+            // Each drawing keeps its own colour while nesting; once the toolpath is up they turn grey. A part
+            // touching another after a move turns red.
+            let colour = if red.contains(&i) {
+                t.error
+            } else if lit || s.selected == Some(pl.part) {
+                t.sel_edge
+            } else if toolpath {
+                grey
+            } else {
+                s.colour(pl.part)
+            };
+            if lit {
+                hovered = Some(format!(
+                    "{}  ·  {} × {}  ·  {:.0}°  ·  drag to move, Esc to cancel",
+                    part.name,
+                    s.len(part.width),
+                    s.len(part.height),
+                    pl.angle_deg
+                ));
             }
-            paint_part(ui.painter(), &placed, tris, &map, ink, t.panel, if is_hover { 2.0 } else { 1.2 });
+            paint_part(ui.painter(), &placed, tris, &map, colour, t.panel, if lit || red.contains(&i) { 2.2 } else { 1.2 });
         }
-        if toolpath && s.posted().is_some() {
+        if toolpath && s.drag.is_none() && s.posted().is_some() {
             // Borrow the cached toolpath out of the state while drawing, then put it back.
             let posted = s.posted.take();
             if let Some(posted) = &posted {
@@ -1398,38 +1769,32 @@ fn sheet_canvas(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
             }
             s.posted = posted;
         }
-    } else if s.busy() {
-        ui.painter().text(
-            sheet_rect.center(),
-            Align2::CENTER_CENTER,
-            crate::i18n::tr_label("Nesting parts…"),
-            FontId::proportional(t.font_heading),
-            t.text_dim,
-        );
-    } else if !s.parts.is_empty() {
-        ui.painter().text(
-            sheet_rect.center(),
-            Align2::CENTER_CENTER,
-            crate::i18n::tr_label("Press Nest Parts to lay out the parts"),
-            FontId::proportional(t.font_heading),
-            t.text_dim,
-        );
     } else {
-        ui.painter().text(
-            sheet_rect.center(),
-            Align2::CENTER_CENTER,
-            crate::i18n::tr_label("Import DXF parts to begin"),
-            FontId::proportional(t.font_heading),
-            t.text_dim,
-        );
+        let text = if s.busy() {
+            "Nesting parts…"
+        } else if !s.parts.is_empty() {
+            "Press Nest Parts to lay out the parts"
+        } else {
+            "Import DXF parts to begin"
+        };
+        ui.painter().text(sheet_rect.center(), Align2::CENTER_CENTER, crate::i18n::tr_label(text), FontId::proportional(t.font_heading), t.text_dim);
     }
+    ui.set_clip_rect(outer_clip);
     crate::scenario::publish_rect("plasma:sheet", sheet_rect);
-    let (text, err) = if let Some(h) = hovered {
+    let (text, err) = if let Some((_, hits, off)) = &s.clash
+        && s.drag.is_some()
+    {
+        if *off {
+            ("Off the usable sheet".to_string(), true)
+        } else {
+            (format!("Too close: touching {} part(s) - keep {} apart", hits.len(), s.len(settings.spacing)), true)
+        }
+    } else if let Some(h) = hovered {
         (h, false)
     } else if let Some((m, e)) = &s.message {
         (m.clone(), *e)
     } else {
-        (String::new(), false)
+        ("Scroll to zoom · middle-drag to pan · drag a part to move it".to_string(), false)
     };
     let mut right = String::new();
     if let Some(n) = &s.nest {
@@ -1442,7 +1807,7 @@ fn sheet_canvas(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
         Align2::LEFT_CENTER,
         text,
         FontId::proportional(t.font_body),
-        if err { t.warning } else { t.text_dim },
+        if err { t.error } else { t.text_dim },
     );
     ui.painter().text(pos2(foot.right() - 4.0, foot.center().y), Align2::RIGHT_CENTER, right, FontId::proportional(t.font_body), t.text_dim);
 }

@@ -587,7 +587,72 @@ pub struct NestSettings {
     pub part_in_part: bool,
 }
 
+/// `rotation_step` value for "Any (best fit)": nest several ways (hull-edge angles, quarter turns, half turns)
+/// and keep the layout that uses the fewest sheets and the least sheet length.
+pub const BEST_FIT: f64 = -1.0;
+/// `rotation_step` value for one of best fit's tries: each part's quarter turns plus the angles that lay its long
+/// hull edges square to the sheet.
+pub const HULL_ANGLES: f64 = -2.0;
+
+/// Convex hull of points (counter-clockwise, monotone chain).
+fn hull(pts: &[P2]) -> Vec<P2> {
+    let mut p: Vec<P2> = pts.iter().copied().filter(|q| q[0].is_finite() && q[1].is_finite()).collect();
+    p.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    p.dedup();
+    if p.len() < 3 {
+        return p;
+    }
+    let cross = |o: P2, a: P2, b: P2| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut h: Vec<P2> = Vec::with_capacity(p.len() * 2);
+    for pass in 0..2 {
+        let start = h.len();
+        let iter: Box<dyn Iterator<Item = &P2>> = if pass == 0 { Box::new(p.iter()) } else { Box::new(p.iter().rev()) };
+        for q in iter {
+            while h.len() >= start + 2 && h.get(h.len() - 2).zip(h.last()).is_some_and(|(a, b)| cross(*a, *b, *q) <= 0.0) {
+                h.pop();
+            }
+            h.push(*q);
+        }
+        h.pop();
+    }
+    h
+}
+
+/// Best-fit angles for a part: the four quarter turns, plus quarter turns that lay each of its longest hull edges
+/// along the sheet's X axis (most parts pack tightest with a long straight edge square to the sheet or a neighbour).
+pub fn best_fit_angles(part: &Part) -> Vec<f64> {
+    let h = hull(part.contours.first().map_or(&[][..], |c| &c.pts[..]));
+    let n = h.len();
+    let mut edges: Vec<(f64, f64)> = (0..n)
+        .filter_map(|i| {
+            let (a, b) = (h.get(i)?, h.get((i + 1) % n)?);
+            Some((dist(*a, *b), (b[1] - a[1]).atan2(b[0] - a[0]).to_degrees()))
+        })
+        .collect();
+    edges.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut out: Vec<f64> = vec![0.0, 90.0, 180.0, 270.0];
+    for (_, ang) in edges.iter().take(4) {
+        for k in 0..4 {
+            let a = (-ang + 90.0 * k as f64).rem_euclid(360.0);
+            if !out.iter().any(|o| {
+                let d = (o - a).rem_euclid(360.0);
+                d.min(360.0 - d) < 1.0
+            }) {
+                out.push(a);
+            }
+        }
+    }
+    out.truncate(20);
+    out
+}
+
 impl NestSettings {
+    fn angles_for(&self, part: &Part) -> Vec<f64> {
+        if self.rotation_step == BEST_FIT || self.rotation_step == HULL_ANGLES {
+            return best_fit_angles(part);
+        }
+        self.angles()
+    }
     fn angles(&self) -> Vec<f64> {
         if !(self.rotation_step > 0.5) {
             return vec![0.0];
@@ -790,6 +855,22 @@ fn raster(part: &Part, angle: f64, cell: f64, spacing: f64, holes_free: bool, li
 /// lowest) at any allowed rotation, so the offcut stays one clean strip across the far end of the sheet, without its spacing halo touching anything placed. Holes in placed parts stay free, so
 /// small parts fill them.
 pub fn nest(parts: &[Part], s: &NestSettings) -> Nest {
+    if s.rotation_step != BEST_FIT {
+        return nest_once(parts, s);
+    }
+    let mut best: Option<((usize, usize, i64), Nest)> = None;
+    for step in [HULL_ANGLES, 90.0, 180.0] {
+        let n = nest_once(parts, &NestSettings { rotation_step: step, ..*s });
+        let length: f64 = (0..n.sheets).map(|k| used_length(parts, &n, k)).sum();
+        let score = (n.unplaced.len() + n.truncated, n.sheets, (length * 100.0).round() as i64);
+        if best.as_ref().is_none_or(|(b, _)| score < *b) {
+            best = Some((score, n));
+        }
+    }
+    best.map(|(_, n)| n).unwrap_or_default()
+}
+
+fn nest_once(parts: &[Part], s: &NestSettings) -> Nest {
     let mut out = Nest::default();
     let uw = s.sheet_w - 2.0 * s.margin;
     let uh = s.sheet_h - 2.0 * s.margin;
@@ -812,14 +893,16 @@ pub fn nest(parts: &[Part], s: &NestSettings) -> Nest {
     out.cell = cell;
     let gw = (uw / cell).floor() as usize;
     let gh = (uh / cell).floor() as usize;
-    let angles = s.angles();
-    let shapes: Vec<Vec<Shape>> =
-        parts
-            .iter()
-            .map(|p| {
-                if p.qty == 0 { Vec::new() } else { angles.iter().filter_map(|a| raster(p, *a, cell, s.spacing, s.part_in_part, (gw, gh))).collect() }
-            })
-            .collect();
+    let shapes: Vec<Vec<Shape>> = parts
+        .iter()
+        .map(|p| {
+            if p.qty == 0 {
+                Vec::new()
+            } else {
+                s.angles_for(p).iter().filter_map(|a| raster(p, *a, cell, s.spacing, s.part_in_part, (gw, gh))).collect()
+            }
+        })
+        .collect();
     items.sort_by(|a, b| {
         let area = |i: usize| parts.get(i).map_or(0.0, |p| p.width * p.height);
         area(*b).total_cmp(&area(*a)).then(a.cmp(b))
@@ -923,6 +1006,109 @@ pub fn nest(parts: &[Part], s: &NestSettings) -> Nest {
     }
     out.sheets = sheets.len();
     out
+}
+
+fn seg_dist(p: P2, a: P2, b: P2) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1]];
+    let l2 = d[0] * d[0] + d[1] * d[1];
+    if l2 <= 1e-18 {
+        return dist(p, a);
+    }
+    let t = (((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1]) / l2).clamp(0.0, 1.0);
+    dist(p, lerp(a, b, t))
+}
+
+fn segs_cross(a: P2, b: P2, c: P2, d: P2) -> bool {
+    let o = |p: P2, q: P2, r: P2| (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+    let (d1, d2, d3, d4) = (o(c, d, a), o(c, d, b), o(a, b, c), o(a, b, d));
+    ((d1 > 0.0) != (d2 > 0.0)) && ((d3 > 0.0) != (d4 > 0.0))
+}
+
+/// Closest approach of two closed polylines (0 when they cross).
+fn loop_gap(a: &[P2], b: &[P2]) -> f64 {
+    let (na, nb) = (a.len(), b.len());
+    let mut m = f64::INFINITY;
+    for i in 0..na {
+        let (Some(&p), Some(&q)) = (a.get(i), a.get((i + 1) % na)) else { continue };
+        for j in 0..nb {
+            let (Some(&r), Some(&t)) = (b.get(j), b.get((j + 1) % nb)) else { continue };
+            if segs_cross(p, q, r, t) {
+                return 0.0;
+            }
+            m = m.min(seg_dist(p, r, t)).min(seg_dist(r, p, q));
+        }
+    }
+    m
+}
+
+fn point_in(p: P2, pts: &[P2]) -> bool {
+    let n = pts.len();
+    let mut odd = false;
+    for i in 0..n {
+        let (Some(a), Some(b)) = (pts.get(i), pts.get((i + 1) % n)) else { continue };
+        if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < a[0] + (p[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]) {
+            odd = !odd;
+        }
+    }
+    odd
+}
+
+/// Is `p` on a placed part's solid (inside its outline, not in a hole)?
+fn on_solid(p: P2, loops: &[Vec<P2>]) -> bool {
+    let mut it = loops.iter();
+    it.next().is_some_and(|outer| point_in(p, outer)) && !it.any(|h| point_in(p, h))
+}
+
+/// The placement on `sheet` whose solid is under `p` (the last drawn wins), for picking parts by hand.
+pub fn placement_at(parts: &[Part], nest: &Nest, sheet: usize, p: P2) -> Option<usize> {
+    nest.placements.iter().enumerate().rev().filter(|(_, pl)| pl.sheet == sheet).find_map(|(i, pl)| {
+        let part = parts.get(pl.part)?;
+        let loops: Vec<Vec<P2>> = part.contours.iter().map(|c| c.pts.iter().map(|q| pl.apply(*q)).collect()).collect();
+        on_solid(p, &loops).then_some(i)
+    })
+}
+
+/// What a placed part is touching after a manual move: the other placements closer than the part spacing (or
+/// overlapping), and whether it left the usable sheet.
+pub fn contacts(parts: &[Part], nest: &Nest, idx: usize, s: &NestSettings) -> (Vec<usize>, bool) {
+    let loops_of = |i: usize| -> Option<Vec<Vec<P2>>> {
+        let pl = nest.placements.get(i)?;
+        Some(parts.get(pl.part)?.contours.iter().map(|c| c.pts.iter().map(|q| pl.apply(*q)).collect()).collect())
+    };
+    let Some(me) = loops_of(idx) else { return (Vec::new(), false) };
+    let Some(sheet) = nest.placements.get(idx).map(|p| p.sheet) else { return (Vec::new(), false) };
+    let bounds = |l: &[Vec<P2>]| {
+        let mut lo = [f64::INFINITY; 2];
+        let mut hi = [f64::NEG_INFINITY; 2];
+        for q in l.first().into_iter().flatten() {
+            lo = [lo[0].min(q[0]), lo[1].min(q[1])];
+            hi = [hi[0].max(q[0]), hi[1].max(q[1])];
+        }
+        (lo, hi)
+    };
+    let (lo, hi) = bounds(&me);
+    let m = s.margin.max(0.0);
+    let off = lo[0] < m - 0.01 || lo[1] < m - 0.01 || hi[0] > s.sheet_w - m + 0.01 || hi[1] > s.sheet_h - m + 0.01;
+    // Contact: closer than the spacing, with a small allowance for the nest grid.
+    let gap = (s.spacing.max(0.0) - 0.05).max(0.05);
+    let mut hits = Vec::new();
+    for (j, pl) in nest.placements.iter().enumerate() {
+        if j == idx || pl.sheet != sheet {
+            continue;
+        }
+        let Some(other) = loops_of(j) else { continue };
+        let (olo, ohi) = bounds(&other);
+        if olo[0] > hi[0] + gap || ohi[0] < lo[0] - gap || olo[1] > hi[1] + gap || ohi[1] < lo[1] - gap {
+            continue;
+        }
+        let near = me.iter().any(|a| other.iter().any(|b| loop_gap(a, b) < gap));
+        let inside = me.first().and_then(|l| l.first()).is_some_and(|p| on_solid(*p, &other))
+            || other.first().and_then(|l| l.first()).is_some_and(|p| on_solid(*p, &me));
+        if near || inside {
+            hits.push(j);
+        }
+    }
+    (hits, off)
 }
 
 /// Sheet utilisation 0–1: net part area over sheet area, for one sheet.
@@ -1193,6 +1379,12 @@ pub struct Pricing {
     pub scrap_allowance_pct: f64,
     /// Rapid moves and torch height finding, seconds per pierce on top of the pierce delay.
     pub overhead_s_per_pierce: f64,
+    /// Charge per pierce, dollars (on top of consumable wear).
+    pub per_pierce: f64,
+    /// Charge per inch of cut, dollars.
+    pub per_inch: f64,
+    /// Sales tax on the customer quote, percent.
+    pub tax_pct: f64,
 }
 
 impl Default for Pricing {
@@ -1207,6 +1399,9 @@ impl Default for Pricing {
             charge_full_sheets: false,
             scrap_allowance_pct: 15.0,
             overhead_s_per_pierce: 2.0,
+            per_pierce: 0.0,
+            per_inch: 0.0,
+            tax_pct: 0.0,
         }
     }
 }
@@ -1239,6 +1434,10 @@ pub struct Quote {
     pub machine: f64,
     pub consumables: f64,
     pub setup: f64,
+    /// Pierce charges (pierces × price per pierce).
+    pub pierce_charge: f64,
+    /// Cut-length charges (inches × price per inch).
+    pub inch_charge: f64,
     pub markup: f64,
     pub total: f64,
     pub lines: Vec<QuoteLine>,
@@ -1265,6 +1464,9 @@ pub fn quote(parts: &[Part], t: &Tool, pr: &Pricing, sheets_area_mm2: Option<f64
         let material = weight * (1.0 + pr.scrap_allowance_pct.max(0.0) / 100.0) * pr.per_lb(t.metal);
         let machine = minutes / 60.0 * pr.machine_per_hour;
         let consumables = p.pierces() as f64 * t.per_pierce;
+        let rate_charges = p.pierces() as f64 * pr.per_pierce.max(0.0) + p.cut_length() / MM_PER_IN * pr.per_inch.max(0.0);
+        q.pierce_charge += p.pierces() as f64 * pr.per_pierce.max(0.0) * n;
+        q.inch_charge += p.cut_length() / MM_PER_IN * pr.per_inch.max(0.0) * n;
         q.cut_in += p.cut_length() / MM_PER_IN * n;
         q.pierces += p.pierces() * p.qty as usize;
         q.minutes += minutes * n;
@@ -1272,7 +1474,7 @@ pub fn quote(parts: &[Part], t: &Tool, pr: &Pricing, sheets_area_mm2: Option<f64
         part_material += material * n;
         q.machine += machine * n;
         q.consumables += consumables * n;
-        let each = (material + machine + consumables) * markup;
+        let each = (material + machine + consumables + rate_charges) * markup;
         q.lines.push(QuoteLine { name: p.name.clone(), qty: p.qty, each, total: each * n });
     }
     q.material = match (pr.charge_full_sheets, sheets_area_mm2) {
@@ -1280,7 +1482,7 @@ pub fn quote(parts: &[Part], t: &Tool, pr: &Pricing, sheets_area_mm2: Option<f64
         _ => part_material,
     };
     q.setup = if parts.iter().any(|p| p.qty > 0) { pr.setup } else { 0.0 };
-    let base = q.material + q.machine + q.consumables + q.setup;
+    let base = q.material + q.machine + q.consumables + q.setup + q.pierce_charge + q.inch_charge;
     q.markup = base * (markup - 1.0);
     q.total = base + q.markup;
     // Spread setup and any full-sheet difference across the lines so they add up to the total.
@@ -1919,6 +2121,57 @@ mod tests {
     }
 
     #[test]
+    fn best_fit_rotation_nests_without_contact_and_squares_a_tilted_part() {
+        // A rectangle drawn at 30 degrees: best fit turns it square to the sheet.
+        let (c, sn) = (30f64.to_radians().cos(), 30f64.to_radians().sin());
+        let rot = |x: f64, y: f64| [c * x - sn * y, sn * x + c * y];
+        let tilted =
+            Part::finish("tilted", vec![Contour::from_points(vec![rot(0.0, 0.0), rot(300.0, 0.0), rot(300.0, 100.0), rot(0.0, 100.0)])], 0).unwrap();
+        let angles = best_fit_angles(&tilted);
+        assert!(angles.iter().any(|a| (a - 330.0).abs() < 0.5 || (a - 150.0).abs() < 0.5), "{angles:?}");
+        let mut parts = sample_parts();
+        parts.push(Part { qty: 6, ..tilted });
+        let length = |n: &Nest| (0..n.sheets).map(|k| used_length(&parts, n, k)).sum::<f64>();
+        // Best fit is never worse than quarter turns, and every layout keeps the spacing.
+        let best = nest(&parts, &NestSettings { rotation_step: BEST_FIT, ..settings(90.0) });
+        let quarter = nest(&parts, &settings(90.0));
+        assert!((best.sheets, length(&best)) <= (quarter.sheets, length(&quarter) + 1e-6));
+        let s = NestSettings { rotation_step: HULL_ANGLES, ..settings(90.0) };
+        let n = nest(&parts, &s);
+        assert!(n.unplaced.is_empty());
+        for nn in [&n, &best] {
+            for i in 0..nn.placements.len() {
+                let (hits, off) = contacts(&parts, nn, i, &s);
+                assert!(hits.is_empty() && !off, "placement {i} touches {hits:?} off={off}");
+            }
+        }
+        // The tilted part was squared up: its placed box is close to 300 x 100.
+        let ti = parts.len() - 1;
+        let pl = n.placements.iter().find(|p| p.part == ti).unwrap();
+        let (lo, hi) = pl.contour(&parts[ti].contours[0]).bounds();
+        let (w, h) = (hi[0] - lo[0], hi[1] - lo[1]);
+        assert!((w.max(h) - 300.0).abs() < 1.0 && (w.min(h) - 100.0).abs() < 1.0, "{w} x {h}");
+    }
+
+    #[test]
+    fn manual_moves_report_contact_and_leaving_the_sheet() {
+        let parts = sample_parts();
+        let s = settings(90.0);
+        let mut n = nest(&parts, &s);
+        assert_eq!(contacts(&parts, &n, 0, &s), (Vec::new(), false));
+        // Drop part 0 onto part 1.
+        let (a, b) = (n.placements[0], n.placements[1]);
+        let pa = a.contour(&parts[a.part].contours[0]).bounds().0;
+        let pb = b.contour(&parts[b.part].contours[0]).bounds().0;
+        n.placements[0].tx += pb[0] - pa[0] + 5.0;
+        n.placements[0].ty += pb[1] - pa[1] + 5.0;
+        assert!(contacts(&parts, &n, 0, &s).0.contains(&1));
+        // Push it off the sheet.
+        n.placements[0].tx -= 5000.0;
+        assert!(contacts(&parts, &n, 0, &s).1);
+    }
+
+    #[test]
     fn hostile_nest_inputs_never_panic() {
         let parts = sample_parts();
         for s in [
@@ -1976,6 +2229,13 @@ mod tests {
         assert!((sum - thin.total).abs() < 1e-6);
         assert!(thick.total > thin.total);
         assert!(thick.weight_lb > thin.weight_lb);
+        // Price per pierce and per cut inch add exactly their share (before markup).
+        let rates = Pricing { per_pierce: 0.5, per_inch: 0.1, markup_pct: 0.0, ..pr.clone() };
+        let base = quote(&parts, tools.iter().find(|t| t.name == "45A 12GA Steel").unwrap(), &Pricing { markup_pct: 0.0, ..pr.clone() }, None);
+        let with = quote(&parts, tools.iter().find(|t| t.name == "45A 12GA Steel").unwrap(), &rates, None);
+        let expect = base.pierces as f64 * 0.5 + base.cut_in * 0.1;
+        assert!((with.total - base.total - expect).abs() < 1e-6);
+        assert!((with.lines.iter().map(|l| l.total).sum::<f64>() - with.total).abs() < 1e-6);
     }
 
     /// LinuxCNC's rules: every arc's centre is equidistant from its ends, and the move after G41.1/G42.1 is a
