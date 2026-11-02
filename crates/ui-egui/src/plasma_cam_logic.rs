@@ -219,6 +219,12 @@ pub struct Part {
     pub qty: u32,
     /// Open chains the DXF had that could not be closed (not cut).
     pub open_chains: usize,
+    /// Kerf side (SheetCAM's contour methods).
+    pub side: Side,
+    /// Cut every contour the other way round (moves the square edge to the other side).
+    pub reverse: bool,
+    /// With no offset: lead in and out from the other side of the line.
+    pub flip_lead: bool,
 }
 
 impl Part {
@@ -254,7 +260,17 @@ impl Part {
                 *c = c.reversed();
             }
         }
-        Ok(Part { name: name.to_string(), contours, width: hi[0] - lo[0], height: hi[1] - lo[1], qty: 1, open_chains })
+        Ok(Part {
+            name: name.to_string(),
+            contours,
+            width: hi[0] - lo[0],
+            height: hi[1] - lo[1],
+            qty: 1,
+            open_chains,
+            side: Side::Outside,
+            reverse: false,
+            flip_lead: false,
+        })
     }
 }
 
@@ -460,6 +476,9 @@ pub fn sample_parts() -> Vec<Part> {
             height: 0.0,
             qty: 0,
             open_chains: 0,
+            side: Side::Outside,
+            reverse: false,
+            flip_lead: false,
         });
         p.qty = qty;
         p
@@ -1278,43 +1297,245 @@ pub fn quote(parts: &[Part], t: &Tool, pr: &Pricing, sheets_area_mm2: Option<f64
 
 // --- Toolpaths and G-code ----------------------------------------------------------------------
 
+/// Which side of the drawn line the kerf goes (SheetCAM's contour methods).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Side {
+    /// The part is kept: outsides cut outside the line, holes inside it.
+    #[default]
+    Outside,
+    /// The drop is kept: outsides cut inside the line, holes outside it.
+    Inside,
+    /// The torch runs on the line (no kerf offset).
+    OnLine,
+}
+
+impl Side {
+    pub fn label(self) -> &'static str {
+        match self {
+            Side::Outside => "Outside",
+            Side::Inside => "Inside",
+            Side::OnLine => "No offset",
+        }
+    }
+}
+
+/// Lead-in or lead-out shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lead {
+    None,
+    Line,
+    Arc,
+}
+
+impl Lead {
+    pub const ALL: [Lead; 3] = [Lead::None, Lead::Line, Lead::Arc];
+    pub fn label(self) -> &'static str {
+        match self {
+            Lead::None => "None",
+            Lead::Line => "Line",
+            Lead::Arc => "Arc",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PostSettings {
     /// Program in inches (G20) or millimetres (G21): match the QtPlasmaC machine config.
     pub inch: bool,
+    pub lead_in_kind: Lead,
+    /// Lead-in length (line) or radius (arc), mm.
     pub lead_in: f64,
+    pub lead_out_kind: Lead,
+    pub lead_out: f64,
+    /// Cut past the start point before leading out, mm.
+    pub overcut: f64,
     /// Select the material in QtPlasmaC with M190 and take its feed rate; otherwise write the tool's feed.
     pub use_material: bool,
-    /// Kerf compensation by the controller (G41.1 with the material's kerf).
+    /// Kerf compensation by the controller (G41.1 / G42.1 with the material's kerf).
     pub kerf_comp: bool,
     /// Holes smaller than this diameter run at `hole_speed_pct` (M67 E3); 0 = off.
     pub small_hole: f64,
     pub hole_speed_pct: f64,
+    /// Rapid traverse for run-time estimates and the simulation, mm/min.
+    pub rapid: f64,
 }
 
 impl Default for PostSettings {
     fn default() -> Self {
-        Self { inch: true, lead_in: 0.2 * MM_PER_IN, use_material: true, kerf_comp: true, small_hole: 1.25 * MM_PER_IN, hole_speed_pct: 60.0 }
+        Self {
+            inch: true,
+            lead_in_kind: Lead::Arc,
+            lead_in: 0.2 * MM_PER_IN,
+            lead_out_kind: Lead::None,
+            lead_out: 0.1 * MM_PER_IN,
+            overcut: 0.0,
+            use_material: true,
+            kerf_comp: true,
+            small_hole: 1.25 * MM_PER_IN,
+            hole_speed_pct: 60.0,
+            rapid: 600.0 * MM_PER_IN,
+        }
     }
 }
 
-/// One cut: a placed contour starting at its lead-in.
+/// Kerf compensation for one cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Comp {
+    Off,
+    /// G41.1: the scrap is left of travel.
+    Left,
+    /// G42.1: the scrap is right of travel.
+    Right,
+}
+
+/// One cut: pierce, lead-in, the contour, overcut and lead-out.
 #[derive(Clone, Debug)]
 pub struct Cut {
     pub placement: usize,
     pub hole: bool,
     pub small: bool,
-    pub lead_start: P2,
+    /// Where the torch fires.
+    pub pierce: P2,
+    /// From `pierce` to `contour.start`.
+    pub lead_in: Vec<Seg>,
     pub contour: Contour,
+    /// From `contour.start` along the contour again.
+    pub overcut: Vec<Seg>,
+    /// From the end of the overcut (or `contour.start`) into the scrap.
+    pub lead_out: Vec<Seg>,
+    pub comp: Comp,
 }
 
-/// The cuts for one sheet in order: parts kept together (holes first, then the outside), each next part the
-/// nearest to the torch, starting from the sheet origin; every contour starts halfway along a segment so the
-/// lead-in meets the edge square-on.
-pub fn toolpath(parts: &[Part], nest: &Nest, sheet: usize, post: &PostSettings) -> Vec<Cut> {
+fn polyline_len(pts: &[P2]) -> f64 {
+    pts.windows(2)
+        .map(|w| match w {
+            [a, b] => dist(*a, *b),
+            _ => 0.0,
+        })
+        .sum()
+}
+
+impl Cut {
+    /// Every move after the pierce, in order.
+    pub fn moves(&self) -> impl Iterator<Item = &Seg> {
+        self.lead_in.iter().chain(self.contour.segs.iter()).chain(self.overcut.iter()).chain(self.lead_out.iter())
+    }
+    /// The whole torch path from the pierce as a polyline, with the indices where the contour starts and ends.
+    pub fn polyline(&self) -> (Vec<P2>, usize, usize) {
+        fn push(segs: &[Seg], pts: &mut Vec<P2>, at: &mut P2) {
+            for s in segs {
+                match *s {
+                    Seg::Line(p) => pts.push(p),
+                    Seg::Arc { to, c, ccw } => arc_points(*at, to, c, ccw, pts),
+                }
+                *at = s.end();
+            }
+        }
+        let mut pts = vec![self.pierce];
+        let mut at = self.pierce;
+        push(&self.lead_in, &mut pts, &mut at);
+        let a = pts.len() - 1;
+        push(&self.contour.segs, &mut pts, &mut at);
+        let b = pts.len() - 1;
+        push(&self.overcut, &mut pts, &mut at);
+        push(&self.lead_out, &mut pts, &mut at);
+        (pts, a, b)
+    }
+    pub fn end(&self) -> P2 {
+        self.lead_out.last().or(self.overcut.last()).map_or(self.contour.start, Seg::end)
+    }
+    /// Length of everything cut (leads included), mm.
+    pub fn length(&self) -> f64 {
+        polyline_len(&self.polyline().0)
+    }
+}
+
+/// Unit travel direction at the start (`at_end` false) or end of `seg`, which begins at `from`.
+fn tangent(from: P2, seg: &Seg, at_end: bool) -> P2 {
+    match *seg {
+        Seg::Line(p) => {
+            let l = dist(from, p).max(1e-12);
+            [(p[0] - from[0]) / l, (p[1] - from[1]) / l]
+        }
+        Seg::Arc { to, c, ccw } => {
+            let q = if at_end { to } else { from };
+            let a = (q[1] - c[1]).atan2(q[0] - c[0]);
+            if ccw { [-a.sin(), a.cos()] } else { [a.sin(), -a.cos()] }
+        }
+    }
+}
+
+/// The first `len` mm of a contour, as segments from its start.
+fn prefix(c: &Contour, len: f64) -> Vec<Seg> {
+    let mut out = Vec::new();
+    let mut left = len.min(c.length());
+    let mut at = c.start;
+    for s in &c.segs {
+        if left <= 1e-6 {
+            break;
+        }
+        match *s {
+            Seg::Line(p) => {
+                let l = dist(at, p);
+                if l <= left {
+                    out.push(*s);
+                    left -= l;
+                } else {
+                    out.push(Seg::Line(lerp(at, p, left / l.max(1e-12))));
+                    break;
+                }
+            }
+            Seg::Arc { to, c: ctr, ccw } => {
+                let r = dist(at, ctr);
+                let l = r * sweep(at, to, ctr, ccw);
+                if l <= left {
+                    out.push(*s);
+                    left -= l;
+                } else {
+                    let a = (at[1] - ctr[1]).atan2(at[0] - ctr[0]) + if ccw { 1.0 } else { -1.0 } * left / r.max(1e-12);
+                    out.push(Seg::Arc { to: [ctr[0] + r * a.cos(), ctr[1] + r * a.sin()], c: ctr, ccw });
+                    break;
+                }
+            }
+        }
+        at = s.end();
+    }
+    out
+}
+
+/// The cuts for one sheet in order, SheetCAM's "keep parts together": each part's holes then its outside, the
+/// next part the nearest to the torch, starting from the sheet origin. Every contour starts halfway along a
+/// segment so leads meet the edge cleanly. `kerf` (mm) sets the shortest entry move kerf compensation needs.
+pub fn toolpath(parts: &[Part], nest: &Nest, sheet: usize, post: &PostSettings, kerf: f64) -> Vec<Cut> {
     let mut left: Vec<usize> = (0..nest.placements.len()).filter(|i| nest.placements.get(*i).is_some_and(|p| p.sheet == sheet)).collect();
     let mut at: P2 = [0.0, 0.0];
     let mut cuts = Vec::new();
+    let kerf = if kerf.is_finite() { kerf.max(0.0) } else { 0.0 };
+    // Part in part: a part sitting in another's hole must be cut before that part, or the hole's slug drops
+    // with it uncut. `inside[i]` lists the placements nested in placement i's holes.
+    let bounds_of = |i: usize| -> Option<(P2, P2)> {
+        let pl = nest.placements.get(i)?;
+        Some(pl.contour(parts.get(pl.part)?.contours.first()?).bounds())
+    };
+    let mut inside: Vec<Vec<usize>> = vec![Vec::new(); nest.placements.len()];
+    for &i in &left {
+        let (Some(pl), Some(part)) = (nest.placements.get(i), nest.placements.get(i).and_then(|pl| parts.get(pl.part))) else { continue };
+        for hole in part.contours.iter().skip(1) {
+            let (hlo, hhi) = pl.contour(hole).bounds();
+            for &j in &left {
+                if j != i
+                    && let Some((lo, hi)) = bounds_of(j)
+                    && lo[0] >= hlo[0]
+                    && lo[1] >= hlo[1]
+                    && hi[0] <= hhi[0]
+                    && hi[1] <= hhi[1]
+                    && let Some(list) = inside.get_mut(i)
+                {
+                    list.push(j);
+                }
+            }
+        }
+    }
     while !left.is_empty() {
         // Nearest part by its box corner nearest the torch.
         let key = |i: &usize| -> f64 {
@@ -1325,13 +1546,31 @@ pub fn toolpath(parts: &[Part], nest: &Nest, sheet: usize, post: &PostSettings) 
                 dist(at, [cx, cy])
             })
         };
-        let Some(k) = (0..left.len()).min_by(|a, b| key(left.get(*a).unwrap_or(&0)).total_cmp(&key(left.get(*b).unwrap_or(&0)))) else { break };
+        // Only parts with nothing left to cut in their holes are ready.
+        let ready = |i: &usize| inside.get(*i).is_none_or(|kids| kids.iter().all(|k| !left.contains(k)));
+        let pool: Vec<usize> = (0..left.len()).filter(|k| left.get(*k).is_some_and(ready)).collect();
+        let pool = if pool.is_empty() { (0..left.len()).collect() } else { pool };
+        let Some(k) = pool.into_iter().min_by(|a, b| key(left.get(*a).unwrap_or(&0)).total_cmp(&key(left.get(*b).unwrap_or(&0)))) else { break };
         let pi = left.swap_remove(k);
         let Some(pl) = nest.placements.get(pi) else { continue };
         let Some(part) = parts.get(pl.part) else { continue };
-        let mut holes: Vec<Contour> = part.contours.iter().skip(1).map(|c| pl.contour(c)).collect();
-        let outer = part.contours.first().map(|c| pl.contour(c));
-        // Holes nearest-first, then the outside.
+        // Inside offset runs every contour the other way round, so the scrap stays on the left; Reverse
+        // direction then swaps the travel (and the square edge) while the kerf stays on the same side.
+        let flip = (part.side == Side::Inside) != part.reverse;
+        let orient = |c: &Contour| {
+            let c = pl.contour(c);
+            if flip { c.reversed() } else { c }
+        };
+        let scrap_left = !part.reverse;
+        // With no offset, Reverse cut side moves the leads to the other side of the line.
+        let lead_left = if part.side == Side::OnLine { scrap_left != part.flip_lead } else { scrap_left };
+        let comp = match (post.kerf_comp && part.side != Side::OnLine, scrap_left) {
+            (false, _) => Comp::Off,
+            (true, true) => Comp::Left,
+            (true, false) => Comp::Right,
+        };
+        let mut holes: Vec<Contour> = part.contours.iter().skip(1).map(orient).collect();
+        let outer = part.contours.first().map(orient);
         let mut order: Vec<(bool, Contour)> = Vec::new();
         while !holes.is_empty() {
             let Some(h) = (0..holes.len()).min_by(|a, b| {
@@ -1350,8 +1589,12 @@ pub fn toolpath(parts: &[Part], nest: &Nest, sheet: usize, post: &PostSettings) 
         for (hole, c) in order {
             let (lo, hi) = c.bounds();
             let size = (hi[0] - lo[0]).min(hi[1] - lo[1]);
-            // Start halfway along the segment nearest the torch that is long enough for a square lead-in.
-            let lead = if hole { post.lead_in.min(size * 0.35) } else { post.lead_in };
+            // Leads that stay inside a hole: at most a third of its width.
+            let inside_hole = hole == (part.side != Side::Inside) && lead_left == scrap_left;
+            let room = if inside_hole { size * 0.3 } else { f64::INFINITY };
+            let lead_in = post.lead_in.max(0.0).min(room);
+            let lead_out = post.lead_out.max(0.0).min(room);
+            // Start halfway along the segment nearest the torch that is long enough for the lead.
             let mut best: Option<(f64, usize)> = None;
             let mut longest = (0.0, 0usize);
             for i in 0..c.segs.len() {
@@ -1359,7 +1602,7 @@ pub fn toolpath(parts: &[Part], nest: &Nest, sheet: usize, post: &PostSettings) 
                 if l > longest.0 {
                     longest = (l, i);
                 }
-                if l >= (lead * 0.8).max(0.5)
+                if l >= (lead_in * 0.8).max(0.5)
                     && let Some((m, _)) = c.mid_of(i)
                 {
                     let d = dist(at, m);
@@ -1368,28 +1611,103 @@ pub fn toolpath(parts: &[Part], nest: &Nest, sheet: usize, post: &PostSettings) 
                     }
                 }
             }
-            let seg = best.map_or(longest.1, |b| b.1);
-            let c = c.restart_at_mid(seg);
-            // Direction at the new start: the first segment's tangent there.
-            let dir = c.segs.first().map(|s| match *s {
-                Seg::Line(p) => {
-                    let l = dist(c.start, p).max(1e-12);
-                    [(p[0] - c.start[0]) / l, (p[1] - c.start[1]) / l]
+            let c = c.restart_at_mid(best.map_or(longest.1, |b| b.1));
+            let p0 = c.start;
+            let d = c.segs.first().map_or([1.0, 0.0], |s| tangent(p0, s, false));
+            let side = |d: P2| if lead_left { [-d[1], d[0]] } else { [d[1], -d[0]] };
+            let n = side(d);
+            let off = |p: P2, v: P2, k: f64| [p[0] + v[0] * k, p[1] + v[1] * k];
+            // An entry move kerf compensation can start on (LinuxCNC needs a straight move longer than the radius).
+            let entry = (kerf * 1.5).max(1.0).min(room.max(0.5));
+            let comp_on = comp != Comp::Off;
+            let (pierce, lead) = match post.lead_in_kind {
+                Lead::Line if lead_in > 0.05 => (off(p0, n, lead_in.max(if comp_on { entry } else { 0.0 })), vec![Seg::Line(p0)]),
+                Lead::Arc if lead_in > 0.05 => {
+                    let ctr = off(p0, n, lead_in);
+                    let a = off(ctr, d, -lead_in);
+                    let arc = Seg::Arc { to: p0, c: ctr, ccw: lead_left };
+                    if comp_on { (off(a, n, entry), vec![Seg::Line(a), arc]) } else { (a, vec![arc]) }
                 }
-                Seg::Arc { c: ctr, ccw, .. } => {
-                    let a = (c.start[1] - ctr[1]).atan2(c.start[0] - ctr[0]);
-                    if ccw { [-a.sin(), a.cos()] } else { [a.sin(), -a.cos()] }
+                _ if comp_on => (off(p0, n, entry), vec![Seg::Line(p0)]),
+                _ => (p0, Vec::new()),
+            };
+            let overcut = if post.overcut > 0.0 { prefix(&c, post.overcut) } else { Vec::new() };
+            let (e, de) = match overcut.last() {
+                Some(last) => {
+                    let from = if overcut.len() >= 2 { overcut.get(overcut.len() - 2).map_or(p0, Seg::end) } else { p0 };
+                    (last.end(), tangent(from, last, true))
                 }
-            });
-            let d = dir.unwrap_or([1.0, 0.0]);
-            // Scrap side is on the left for both directions (outer clockwise, holes counter-clockwise).
-            let lead_start = [c.start[0] - d[1] * lead, c.start[1] + d[0] * lead];
+                None => (p0, d),
+            };
+            let ne = side(de);
+            let out = match post.lead_out_kind {
+                Lead::Line if lead_out > 0.05 => vec![Seg::Line(off(e, ne, lead_out))],
+                Lead::Arc if lead_out > 0.05 => {
+                    let ctr = off(e, ne, lead_out);
+                    vec![Seg::Arc { to: off(ctr, de, lead_out), c: ctr, ccw: lead_left }]
+                }
+                _ => Vec::new(),
+            };
             let small = hole && post.small_hole > 0.0 && (hi[0] - lo[0]).max(hi[1] - lo[1]) < post.small_hole;
-            at = c.start;
-            cuts.push(Cut { placement: pi, hole, small, lead_start, contour: c });
+            let cut = Cut { placement: pi, hole, small, pierce, lead_in: lead, contour: c, overcut, lead_out: out, comp };
+            at = cut.end();
+            cuts.push(cut);
         }
     }
     cuts
+}
+
+/// One step of the torch for the simulation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveKind {
+    Rapid,
+    Pierce,
+    Cut,
+}
+
+#[derive(Clone, Debug)]
+pub struct Motion {
+    pub kind: MoveKind,
+    pub pts: Vec<P2>,
+    pub seconds: f64,
+}
+
+/// The torch's moves for a sheet, timed: rapids at `post.rapid`, pierces at the tool's delay plus height finding,
+/// cuts at the tool's feed (small holes slowed).
+pub fn motions(cuts: &[Cut], tool: &Tool, post: &PostSettings) -> Vec<Motion> {
+    let rapid = if post.rapid > 1.0 { post.rapid } else { 15_000.0 };
+    let feed = if tool.feed > 1.0 { tool.feed } else { 1000.0 };
+    let mut out = Vec::new();
+    let mut at: P2 = [0.0, 0.0];
+    for cut in cuts {
+        out.push(Motion { kind: MoveKind::Rapid, pts: vec![at, cut.pierce], seconds: dist(at, cut.pierce) / rapid * 60.0 });
+        out.push(Motion { kind: MoveKind::Pierce, pts: vec![cut.pierce], seconds: tool.pierce_delay.max(0.0) + 0.5 });
+        let (pts, _, _) = cut.polyline();
+        let speed = if cut.small { feed * post.hole_speed_pct.clamp(10.0, 100.0) / 100.0 } else { feed };
+        let seconds = polyline_len(&pts) / speed * 60.0;
+        out.push(Motion { kind: MoveKind::Cut, pts, seconds });
+        at = cut.end();
+    }
+    out.push(Motion { kind: MoveKind::Rapid, pts: vec![at, [0.0, 0.0]], seconds: dist(at, [0.0, 0.0]) / rapid * 60.0 });
+    out
+}
+
+/// The point `frac` (0–1) of the way along a polyline, and the points up to it.
+pub fn along(pts: &[P2], frac: f64) -> (P2, Vec<P2>) {
+    let mut want = polyline_len(pts) * frac.clamp(0.0, 1.0);
+    let mut done = vec![pts.first().copied().unwrap_or([0.0, 0.0])];
+    for w in pts.windows(2) {
+        let [a, b] = w else { continue };
+        let l = dist(*a, *b);
+        if l >= want {
+            let p = lerp(*a, *b, if l > 0.0 { want / l } else { 0.0 });
+            done.push(p);
+            return (p, done);
+        }
+        want -= l;
+        done.push(*b);
+    }
+    (done.last().copied().unwrap_or([0.0, 0.0]), done)
 }
 
 /// QtPlasmaC G-code for one sheet.
@@ -1414,23 +1732,28 @@ pub fn gcode(parts: &[Part], nest: &Nest, sheet: usize, tool: &Tool, post: &Post
         let _ = writeln!(g, "F{:.1}", tool.feed * k);
     }
     let mut last_part = usize::MAX;
-    for cut in toolpath(parts, nest, sheet, post) {
+    for cut in toolpath(parts, nest, sheet, post, tool.kerf) {
         if cut.placement != last_part {
             last_part = cut.placement;
             let name = nest.placements.get(cut.placement).and_then(|p| parts.get(p.part)).map_or("part", |p| p.name.as_str());
             let _ = writeln!(g, "({})", name.replace(['(', ')'], ""));
         }
-        let _ = writeln!(g, "G0 {}", xy(cut.lead_start));
+        let _ = writeln!(g, "G0 {}", xy(cut.pierce));
         let _ = writeln!(g, "M3 $0 S1");
-        if post.kerf_comp {
-            let _ = writeln!(g, "G41.1 D#<_hal[plasmac_run.kerf-width-f]>");
+        match cut.comp {
+            Comp::Left => {
+                let _ = writeln!(g, "G41.1 D#<_hal[plasmac_run.kerf-width-f]>");
+            }
+            Comp::Right => {
+                let _ = writeln!(g, "G42.1 D#<_hal[plasmac_run.kerf-width-f]>");
+            }
+            Comp::Off => {}
         }
         if cut.small {
             let _ = writeln!(g, "M67 E3 Q{:.0}", post.hole_speed_pct.clamp(10.0, 100.0));
         }
-        let _ = writeln!(g, "G1 {}", xy(cut.contour.start));
-        let mut at = cut.contour.start;
-        for s in &cut.contour.segs {
+        let mut at = cut.pierce;
+        for s in cut.moves() {
             match *s {
                 Seg::Line(p) => {
                     if dist(at, p) > 1e-6 {
@@ -1446,7 +1769,7 @@ pub fn gcode(parts: &[Part], nest: &Nest, sheet: usize, tool: &Tool, post: &Post
         if cut.small {
             let _ = writeln!(g, "M67 E3 Q0");
         }
-        if post.kerf_comp {
+        if cut.comp != Comp::Off {
             let _ = writeln!(g, "G40");
         }
         let _ = writeln!(g, "M5 $0");
@@ -1655,6 +1978,32 @@ mod tests {
         assert!(thick.weight_lb > thin.weight_lb);
     }
 
+    /// LinuxCNC's rules: every arc's centre is equidistant from its ends, and the move after G41.1/G42.1 is a
+    /// straight line.
+    fn check_gcode(g: &str) {
+        let mut at = [0.0f64, 0.0];
+        let mut after_comp = false;
+        for line in g.lines() {
+            let val = |c: char| line.split_whitespace().find_map(|w| w.strip_prefix(c)?.parse::<f64>().ok());
+            let motion = line.starts_with("G0 ") || line.starts_with("G1 ") || line.starts_with("G2 ") || line.starts_with("G3 ");
+            if after_comp && motion {
+                assert!(line.starts_with("G1 "), "first move after compensation must be straight: {line}");
+                after_comp = false;
+            }
+            if line.starts_with("G41.1") || line.starts_with("G42.1") {
+                after_comp = true;
+            }
+            if line.starts_with("G2 ") || line.starts_with("G3 ") {
+                let (x, y, i, j) = (val('X').unwrap(), val('Y').unwrap(), val('I').unwrap(), val('J').unwrap());
+                let c = [at[0] + i, at[1] + j];
+                assert!((dist(at, c) - dist([x, y], c)).abs() < 0.0005, "{line}");
+            }
+            if let (Some(x), Some(y)) = (val('X'), val('Y')) {
+                at = [x, y];
+            }
+        }
+    }
+
     #[test]
     fn gcode_uses_arcs_material_and_kerf_comp() {
         let parts = sample_parts();
@@ -1668,21 +2017,97 @@ mod tests {
         assert!(g.contains("G2 ") && g.contains("G3 "), "circles and corners post as arcs");
         assert!(g.contains("M67 E3 Q60"), "small holes slow down");
         assert!(g.trim_end().ends_with("M2"));
-        // Every arc's centre is equidistant from its ends (LinuxCNC rejects a mismatch).
-        let mut at = [0.0f64, 0.0];
-        for line in g.lines() {
-            let val = |c: char| line.split_whitespace().find_map(|w| w.strip_prefix(c)?.parse::<f64>().ok());
-            if line.starts_with("G2 ") || line.starts_with("G3 ") {
-                let (x, y, i, j) = (val('X').unwrap(), val('Y').unwrap(), val('I').unwrap(), val('J').unwrap());
-                let c = [at[0] + i, at[1] + j];
-                assert!((dist(at, c) - dist([x, y], c)).abs() < 0.0005, "{line}");
-            }
-            if let (Some(x), Some(y)) = (val('X'), val('Y')) {
-                at = [x, y];
-            }
-        }
+        check_gcode(&g);
         // A rotated nest still posts true arcs.
         let n45 = nest(&parts, &settings(45.0));
-        assert!(gcode(&parts, &n45, 0, &tool, &PostSettings::default()).contains("G2 "));
+        let g45 = gcode(&parts, &n45, 0, &tool, &PostSettings::default());
+        assert!(g45.contains("G2 "));
+        check_gcode(&g45);
+    }
+
+    #[test]
+    fn every_lead_and_side_posts_valid_gcode_and_pierces_in_the_scrap() {
+        let tool = default_tools().into_iter().find(|t| t.number == 61).unwrap();
+        for side in [Side::Outside, Side::Inside, Side::OnLine] {
+            for reverse in [false, true] {
+                for (lead_in_kind, lead_out_kind, overcut) in
+                    [(Lead::Arc, Lead::Arc, 3.0), (Lead::Line, Lead::Line, 0.0), (Lead::None, Lead::None, 0.0), (Lead::Arc, Lead::None, 0.0)]
+                {
+                    let mut parts = sample_parts();
+                    for p in &mut parts {
+                        p.side = side;
+                        p.reverse = reverse;
+                    }
+                    let n = nest(&parts, &settings(90.0));
+                    let post = PostSettings { lead_in_kind, lead_out_kind, overcut, ..PostSettings::default() };
+                    let g = gcode(&parts, &n, 0, &tool, &post);
+                    check_gcode(&g);
+                    let contours: usize = n.placements.iter().filter(|p| p.sheet == 0).map(|p| parts[p.part].contours.len()).sum();
+                    let (left, right) = (g.matches("G41.1").count(), g.matches("G42.1").count());
+                    match (side, reverse) {
+                        (Side::OnLine, _) => assert_eq!(left + right, 0),
+                        (_, false) => assert_eq!((left, right), (contours, 0)),
+                        (_, true) => assert_eq!((left, right), (0, contours)),
+                    }
+                    for cut in toolpath(&parts, &n, 0, &post, tool.kerf) {
+                        // Direction: outsides clockwise unless Inside xor Reverse.
+                        let flip = (side == Side::Inside) != reverse;
+                        let ccw = cut.contour.signed_area() > 0.0;
+                        assert_eq!(ccw, cut.hole != flip, "{side:?} reverse={reverse} hole={}", cut.hole);
+                        if lead_in_kind == Lead::None && side == Side::OnLine {
+                            continue;
+                        }
+                        // The pierce is on the scrap side of the line.
+                        let inside_line = inside(cut.pierce, &cut.contour);
+                        let scrap_inside = cut.hole != (side == Side::Inside);
+                        if side != Side::OnLine {
+                            assert_eq!(inside_line, scrap_inside, "{side:?} reverse={reverse} hole={} {lead_in_kind:?}", cut.hole);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parts_in_holes_are_cut_before_the_part_around_them() {
+        let parts = sample_parts();
+        let n = nest(&parts, &settings(90.0));
+        let tool = default_tools().into_iter().find(|t| t.number == 61).unwrap();
+        let cuts = toolpath(&parts, &n, 0, &PostSettings::default(), tool.kerf);
+        let washer = parts.iter().position(|p| p.name.starts_with("washer")).unwrap();
+        let mut checked = 0;
+        for (wi, w) in n.placements.iter().enumerate().filter(|(_, p)| p.part == washer && p.sheet == 0) {
+            let (lo, hi) = w.contour(&parts[washer].contours[0]).bounds();
+            let last_washer_cut = cuts.iter().rposition(|c| c.placement == wi).unwrap();
+            for (ci, c) in cuts.iter().enumerate().filter(|(_, c)| c.hole && c.placement != wi) {
+                let (hlo, hhi) = c.contour.bounds();
+                if lo[0] >= hlo[0] && lo[1] >= hlo[1] && hi[0] <= hhi[0] && hi[1] <= hhi[1] {
+                    assert!(last_washer_cut < ci, "the washer in a hole is cut after the hole");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "some washer sits in a plate's hole");
+    }
+
+    #[test]
+    fn simulation_motions_cover_the_whole_program() {
+        let parts = sample_parts();
+        let n = nest(&parts, &settings(90.0));
+        let tool = default_tools().into_iter().find(|t| t.number == 61).unwrap();
+        let post = PostSettings::default();
+        let cuts = toolpath(&parts, &n, 0, &post, tool.kerf);
+        let m = motions(&cuts, &tool, &post);
+        assert_eq!(m.len(), cuts.len() * 3 + 1);
+        assert_eq!(m.iter().filter(|x| x.kind == MoveKind::Pierce).count(), cuts.len());
+        let total: f64 = m.iter().map(|x| x.seconds).sum();
+        assert!(total > 60.0 && total < 3600.0, "{total}");
+        let cut = m.iter().find(|x| x.kind == MoveKind::Cut).unwrap();
+        let (end, done) = along(&cut.pts, 1.0);
+        assert!(dist(end, *cut.pts.last().unwrap()) < 1e-9 && done.len() == cut.pts.len());
+        let (mid, _) = along(&cut.pts, 0.5);
+        assert!(mid[0].is_finite());
+        assert_eq!(along(&[], 0.5).1.len(), 1);
     }
 }
