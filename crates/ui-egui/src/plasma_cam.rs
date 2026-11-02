@@ -102,7 +102,7 @@ impl SheetView {
     fn map(&self, q: [f64; 2]) -> egui::Pos2 {
         pos2((self.ox + q[0] * self.scale) as f32, (self.oy - q[1] * self.scale) as f32)
     }
-    fn to_sheet(&self, p: egui::Pos2) -> [f64; 2] {
+    fn sheet_at(&self, p: egui::Pos2) -> [f64; 2] {
         [(f64::from(p.x) - self.ox) / self.scale, (self.oy - f64::from(p.y)) / self.scale]
     }
 }
@@ -352,7 +352,12 @@ impl State {
             match spawned {
                 Ok(_) => {
                     self.job = Some(rx);
-                    self.message = Some(("Nesting…".into(), false));
+                    let text = if settings.rotation_step == logic::BEST_FIT {
+                        format!("Searching for the best fit (up to {} s)…", logic::SEARCH_BUDGET.as_secs())
+                    } else {
+                        "Nesting…".into()
+                    };
+                    self.message = Some((text, false));
                 }
                 Err(e) => self.message = Some((format!("Could not start nesting: {e}"), true)),
             }
@@ -475,7 +480,8 @@ fn groups(app: &SolveApp) -> Vec<(&'static str, Vec<Button>)> {
             Button { on: has_parts, ..button("clear", "Clear Parts", "delete") },
         ],
     )];
-    let sheets = vec![Button { on: nested, ..button("prev", "Previous", "reverse_normal") }, Button { on: nested, ..button("next", "Next", "play") }];
+    let sheets =
+        vec![Button { on: nested, ..button("prev", "Previous", "sheet_prev") }, Button { on: nested, ..button("next", "Next", "sheet_next") }];
     match s.page {
         Page::Setup => {
             out.push(("Tools", vec![button("import_tools", "Import Tools", "import"), button("export_materials", "QtPlasmaC Materials", "export")]));
@@ -495,7 +501,6 @@ fn groups(app: &SolveApp) -> Vec<(&'static str, Vec<Button>)> {
             out.push(("Sheets", sheets));
         }
         Page::Toolpath => {
-            out.push(("Toolpath", vec![Button { on: has_parts, ..button("generate", "Generate", "path") }]));
             let simulating = s.sim.is_some();
             out.push((
                 "Simulate",
@@ -641,11 +646,6 @@ fn act(app: &mut SolveApp, ctx: &egui::Context, id: &str) {
                 s.page = Page::Nest;
             }
         }
-        "generate" => {
-            if s.nest.is_none() && !s.busy() {
-                s.run_nest();
-            }
-        }
         "unnest" => s.set_nest(None),
         "rotate" => {
             let i = ROTATIONS.iter().position(|(a, _)| (*a - s.rotation_step).abs() < 0.1).unwrap_or(2);
@@ -724,25 +724,60 @@ fn file_name(path: &str) -> String {
 
 fn import(app: &mut SolveApp) {
     app.pick_open_for(&["dxf"], |app, path| {
-        let Some(path) = path else { return };
-        let name = file_name(&path);
-        let result = solidcraft_engine::io::vfs::read_to_string(&path, solidcraft_engine::io::MAX_DRAWING_BYTES)
-            .map_err(|e| format!("{name}: {e}"))
-            .and_then(|text| logic::part_from_dxf(&name, &text));
-        let s = &mut app.plasma_cam;
-        match result {
-            Ok(part) => {
-                s.message = Some(if part.open_chains > 0 {
-                    (format!("{name}: {} open outline(s) skipped; close them in your CAD.", part.open_chains), true)
-                } else {
-                    (format!("Imported {name}."), false)
-                });
-                s.add_part(part);
-                s.selected = Some(s.parts.len() - 1);
-            }
-            Err(e) => s.message = Some((e, true)),
+        if let Some(path) = path {
+            import_path(app, &path);
         }
     });
+}
+
+/// Add the DXF at `path` to the parts list (Import DXF, a dropped file, the control channel's `ui.file`).
+pub fn import_path(app: &mut SolveApp, path: &str) {
+    let name = file_name(path);
+    let result = solidcraft_engine::io::vfs::read_to_string(path, solidcraft_engine::io::MAX_DRAWING_BYTES)
+        .map_err(|e| format!("{name}: {e}"))
+        .and_then(|text| logic::part_from_dxf(&name, &text));
+    let s = &mut app.plasma_cam;
+    match result {
+        Ok(part) => {
+            s.message = Some(if part.open_chains > 0 {
+                (format!("{name}: {} open outline(s) skipped; close them in your CAD.", part.open_chains), true)
+            } else {
+                (format!("Imported {name}."), false)
+            });
+            s.add_part(part);
+            s.selected = Some(s.parts.len() - 1);
+        }
+        Err(e) => s.message = Some((e, true)),
+    }
+}
+
+/// Is this a drawing Plasma Nest takes as a part (while the workspace is open)?
+pub fn takes_path(app: &SolveApp, path: &str) -> bool {
+    app.ui.tab == "PLASMA" && takes_path_str(path)
+}
+
+/// DXF files dropped on the window while Plasma Nest is open become parts (any number at once);
+/// other files are left for the app to open as usual.
+pub fn take_drops(app: &mut SolveApp, ctx: &egui::Context) {
+    if app.ui.tab != "PLASMA" {
+        return;
+    }
+    let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+    let paths: Vec<String> = dropped.iter().map(|f| f.path().to_string_lossy().to_string()).filter(|p| takes_path_str(p)).collect();
+    if paths.is_empty() {
+        return;
+    }
+    ctx.input_mut(|i| i.raw.dropped_files.retain(|f| !takes_path_str(&f.path().to_string_lossy())));
+    for p in &paths {
+        import_path(app, p);
+    }
+    if paths.len() > 1 {
+        app.plasma_cam.message = Some((format!("Imported {} drawings.", paths.len()), false));
+    }
+}
+
+fn takes_path_str(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".dxf")
 }
 
 fn import_tools(app: &mut SolveApp) {
@@ -1289,6 +1324,11 @@ fn toolpath_panel(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
         crate::ui_kit::checkbox(ui, "Inch program (G20) - match the QtPlasmaC config", &mut p.inch);
         crate::ui_kit::checkbox(ui, "Select the QtPlasmaC material (M190)", &mut p.use_material);
         crate::ui_kit::checkbox(ui, "Kerf compensation in QtPlasmaC (G41.1 / G42.1)", &mut p.kerf_comp);
+        if !p.kerf_comp {
+            let half = s.tool().map_or(0.0, |t| t.kerf) / 2.0;
+            let off = if s.metric { format!("{half:.2} mm") } else { format!("{:.4} in", half / MM_PER_IN) };
+            note(ui, &format!("Kerf offset in the toolpath, as SheetCAM does: the torch runs {off} off the line."));
+        }
         s.post = p;
         if s.busy() {
             ui.horizontal(|ui| {
@@ -1298,7 +1338,7 @@ fn toolpath_panel(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
             return;
         }
         if s.nest.is_none() {
-            note(ui, "Press Generate to nest the parts and build the toolpath.");
+            note(ui, "Nest the parts (Nest tab) and the toolpath is built from the nest.");
             return;
         }
         let metric = s.metric;
@@ -1307,7 +1347,7 @@ fn toolpath_panel(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
         let cut: f64 = posted.cuts.iter().map(Cut::length).sum();
         let pierces = posted.cuts.len();
         let total = posted.total;
-        let arcs = posted.code.lines().filter(|l| l.starts_with("G2 ") || l.starts_with("G3 ")).count();
+        let arcs = posted.code.lines().map(str::trim_start).filter(|l| l.starts_with("G2 ") || l.starts_with("G3 ")).count();
         let lines = posted.code.lines().count();
         let preview: String = posted.code.lines().take(80).collect::<Vec<_>>().join("\n");
         ui.add_space(t.space_6);
@@ -1601,7 +1641,7 @@ fn sheet_canvas(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
         let s = &app.plasma_cam;
         let can_move = s.sim.is_none() && !s.busy();
         match (&s.nest, over) {
-            (Some(n), Some(p)) if can_move => logic::placement_at(&s.parts, n, s.sheet, view.to_sheet(p)),
+            (Some(n), Some(p)) if can_move => logic::placement_at(&s.parts, n, s.sheet, view.sheet_at(p)),
             _ => None,
         }
     };
@@ -1612,7 +1652,7 @@ fn sheet_canvas(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
             && let (Some(i), Some(p)) = (under, over)
             && let Some(pl) = s.nest.as_ref().and_then(|n| n.placements.get(i))
         {
-            s.drag = Some(Drag { placement: i, grab: view.to_sheet(p), from: (pl.tx, pl.ty) });
+            s.drag = Some(Drag { placement: i, grab: view.sheet_at(p), from: (pl.tx, pl.ty) });
         }
         if let Some(d) = s.drag {
             let restore = |s: &mut State, at: (f64, f64)| {
@@ -1627,7 +1667,7 @@ fn sheet_canvas(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
                 s.clash = None;
             } else {
                 if let Some(p) = pointer {
-                    let q = view.to_sheet(p);
+                    let q = view.sheet_at(p);
                     restore(s, (d.from.0 + q[0] - d.grab[0], d.from.1 + q[1] - d.grab[1]));
                 }
                 let (hits, off) = s.nest.as_ref().map(|n| logic::contacts(&s.parts, n, d.placement, &settings)).unwrap_or_default();
@@ -1741,7 +1781,8 @@ fn sheet_canvas(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect) {
             // touching another after a move turns red.
             let colour = if red.contains(&i) {
                 t.error
-            } else if lit || s.selected == Some(pl.part) {
+            } else if lit || (!toolpath && s.selected == Some(pl.part)) {
+                // On the Toolpath tab a selected part stays grey so its cut path reads; the list shows the selection.
                 t.sel_edge
             } else if toolpath {
                 grey

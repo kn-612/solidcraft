@@ -405,6 +405,12 @@ pub fn part_from_geoms(name: &str, geoms: &[Geom2]) -> Result<Part, String> {
     Part::finish(name, loops, open_chains)
 }
 
+/// A part from closed contours (largest is the outline).
+#[cfg(test)]
+pub fn part_from_contours(name: &str, contours: Vec<Contour>) -> Result<Part, String> {
+    Part::finish(name, contours, 0)
+}
+
 /// A part from a DXF file's text.
 pub fn part_from_dxf(name: &str, text: &str) -> Result<Part, String> {
     let geoms = solidcraft_engine::io::read_dxf(text).map_err(|e| format!("{name}: {e}"))?;
@@ -687,6 +693,25 @@ impl Bits {
             *word |= 1u64 << (x % 64);
         }
     }
+    /// Does `mask`, placed with its (0,0) at column `x`, row `y`, hit anything set? The mask's rows are taken
+    /// in a spread-out order and only their set words: a part that overlaps something usually shows it within
+    /// its first few rows checked.
+    fn hits_fast(&self, mask: &Bits, rows: &[(usize, usize, usize)], x: i64, y: i64) -> bool {
+        for &(r, k0, k1) in rows {
+            let sy = y + r as i64;
+            if sy < 0 || sy >= self.h as i64 {
+                continue;
+            }
+            let mrow = mask.row(r);
+            for k in k0..k1 {
+                let m = mrow.get(k).copied().unwrap_or(0);
+                if m != 0 && self.get64(sy as usize, x + 64 * k as i64) & m != 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
     /// 64 cells of row `y` starting at column `x` (outside the map reads empty).
     fn get64(&self, y: usize, x: i64) -> u64 {
         let row = self.row(y);
@@ -694,22 +719,6 @@ impl Bits {
         let w = x.div_euclid(64);
         let s = x.rem_euclid(64) as u32;
         if s == 0 { word(w) } else { (word(w) >> s) | (word(w + 1) << (64 - s)) }
-    }
-    /// Does `mask` placed with its (0,0) at column `x`, row `y` hit anything set?
-    fn hits(&self, mask: &Bits, x: i64, y: i64) -> bool {
-        for r in 0..mask.h {
-            let sy = y + r as i64;
-            if sy < 0 || sy >= self.h as i64 {
-                continue;
-            }
-            let mrow = mask.row(r);
-            for (k, m) in mrow.iter().enumerate() {
-                if *m != 0 && self.get64(sy as usize, x + 64 * k as i64) & m != 0 {
-                    return true;
-                }
-            }
-        }
-        false
     }
     fn or_at(&mut self, mask: &Bits, x: usize, y: usize) {
         for r in 0..mask.h {
@@ -732,6 +741,23 @@ struct Shape {
     body: Bits,
     halo: Bits,
     grow: usize,
+    /// The halo's non-empty rows, spread out (row, first word, end word), for `Bits::hits_fast`.
+    rows: Vec<(usize, usize, usize)>,
+}
+
+impl Shape {
+    fn blocked(&self, grid: &Bits, x: usize, y: usize) -> bool {
+        grid.hits_fast(&self.halo, &self.rows, x as i64 - self.grow as i64, y as i64 - self.grow as i64)
+    }
+}
+
+/// 0..n in a spread-out order (bit-reversed), so neighbouring checks probe far-apart rows.
+fn spread(n: usize) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let bits = usize::BITS - n.leading_zeros();
+    (0..(1usize << bits)).map(|i| i.reverse_bits() >> (usize::BITS - bits)).filter(|&i| i < n).collect()
 }
 
 fn raster(part: &Part, angle: f64, cell: f64, spacing: f64, holes_free: bool, limit: (usize, usize)) -> Option<Shape> {
@@ -818,7 +844,7 @@ fn raster(part: &Part, angle: f64, cell: f64, spacing: f64, holes_free: bool, li
         }
     }
     // Halo: grow by the spacing (square neighbourhood), plus a cell for sampling slack.
-    let grow = ((spacing.max(0.0) / cell).ceil() as usize + 1).min(2000);
+    let grow = (((spacing.max(0.0) + 0.3 * cell) / cell).ceil() as usize).min(2000);
     let (hw, hh) = (w + 2 * grow, h + 2 * grow);
     let mut horiz = vec![false; hw * h];
     for y in 0..h {
@@ -848,7 +874,16 @@ fn raster(part: &Part, angle: f64, cell: f64, spacing: f64, holes_free: bool, li
             }
         }
     }
-    Some(Shape { angle, lo, body, halo, grow })
+    let rows = spread(halo.h)
+        .into_iter()
+        .filter_map(|r| {
+            let row = halo.row(r);
+            let k0 = row.iter().position(|w| *w != 0)?;
+            let k1 = row.iter().rposition(|w| *w != 0)? + 1;
+            Some((r, k0, k1))
+        })
+        .collect();
+    Some(Shape { angle, lo, body, halo, grow, rows })
 }
 
 /// True-shape nesting on a grid: each part, biggest first, goes where its right edge is nearest the origin (then
@@ -859,21 +894,55 @@ pub fn nest(parts: &[Part], s: &NestSettings) -> Nest {
         return nest_once(parts, s);
     }
     let mut best: Option<((usize, usize, i64), Nest)> = None;
-    for step in [HULL_ANGLES, 90.0, 180.0] {
-        let n = nest_once(parts, &NestSettings { rotation_step: step, ..*s });
-        let length: f64 = (0..n.sheets).map(|k| used_length(parts, &n, k)).sum();
-        let score = (n.unplaced.len() + n.truncated, n.sheets, (length * 100.0).round() as i64);
-        if best.as_ref().is_none_or(|(b, _)| score < *b) {
-            best = Some((score, n));
+    let quick = [HULL_ANGLES, 90.0, 180.0].map(|step| nest_once(parts, &NestSettings { rotation_step: step, ..*s }));
+    for n in quick.into_iter().chain(std::iter::once(nest_search(parts, s, SEARCH_BUDGET))) {
+        let sc = score(parts, &n);
+        if best.as_ref().is_none_or(|(b, _)| sc < *b) {
+            best = Some((sc, n));
         }
     }
     best.map(|(_, n)| n).unwrap_or_default()
 }
 
-fn nest_once(parts: &[Part], s: &NestSettings) -> Nest {
-    let mut out = Nest::default();
+/// How a nest run picks among the places and turns that fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rule {
+    /// Smallest right edge, then lowest: fills along the sheet's width first, offcut at the far end.
+    RightEdge,
+    /// Lowest top edge, then leftmost.
+    TopEdge,
+    /// Keep everything placed so far in the smallest square, then the smallest box.
+    Compact,
+}
+
+/// One rotated part image per angle for every part, and the grid they were drawn on.
+struct Prepared {
+    cell: f64,
+    gw: usize,
+    gh: usize,
+    shapes: Vec<Vec<Shape>>,
+}
+
+fn prepare(parts: &[Part], s: &NestSettings, angles: &dyn Fn(&Part) -> Vec<f64>) -> Option<Prepared> {
     let uw = s.sheet_w - 2.0 * s.margin;
     let uh = s.sheet_h - 2.0 * s.margin;
+    if !(uw > 1.0) || !(uh > 1.0) || !uw.is_finite() || !uh.is_finite() {
+        return None;
+    }
+    // About a million cells per sheet, never finer than 0.5 mm.
+    let cell = ((uw * uh / 1.0e6).sqrt()).clamp(0.5, 25.0);
+    let gw = (uw / cell).floor() as usize;
+    let gh = (uh / cell).floor() as usize;
+    let shapes = parts
+        .iter()
+        .map(|p| {
+            if p.qty == 0 { Vec::new() } else { angles(p).iter().filter_map(|a| raster(p, *a, cell, s.spacing, s.part_in_part, (gw, gh))).collect() }
+        })
+        .collect();
+    Some(Prepared { cell, gw, gh, shapes })
+}
+
+fn instances(parts: &[Part], out: &mut Nest) -> Vec<usize> {
     let mut items: Vec<usize> = Vec::new();
     for (i, p) in parts.iter().enumerate() {
         for _ in 0..p.qty {
@@ -884,34 +953,154 @@ fn nest_once(parts: &[Part], s: &NestSettings) -> Nest {
             }
         }
     }
-    if !(uw > 1.0) || !(uh > 1.0) || !uw.is_finite() || !uh.is_finite() {
-        out.unplaced = items;
-        return out;
-    }
-    // About a million cells per sheet, never finer than 0.5 mm.
-    let cell = ((uw * uh / 1.0e6).sqrt()).clamp(0.5, 25.0);
-    out.cell = cell;
-    let gw = (uw / cell).floor() as usize;
-    let gh = (uh / cell).floor() as usize;
-    let shapes: Vec<Vec<Shape>> = parts
-        .iter()
-        .map(|p| {
-            if p.qty == 0 {
-                Vec::new()
-            } else {
-                s.angles_for(p).iter().filter_map(|a| raster(p, *a, cell, s.spacing, s.part_in_part, (gw, gh))).collect()
-            }
-        })
-        .collect();
     items.sort_by(|a, b| {
         let area = |i: usize| parts.get(i).map_or(0.0, |p| p.width * p.height);
         area(*b).total_cmp(&area(*a)).then(a.cmp(b))
     });
+    items
+}
+
+/// Multi-start: every rule, and every turn of the first part, keeping the best layout. (Experiment.)
+/// Turns tried by the "Any (best fit)" search: every 15° plus the part's long hull edges laid flat.
+fn search_angles(part: &Part) -> Vec<f64> {
+    let mut out: Vec<f64> = (0..24).map(|k| k as f64 * 15.0).collect();
+    for a in best_fit_angles(part) {
+        if !out.iter().any(|o| {
+            let d = (o - a).rem_euclid(360.0);
+            d.min(360.0 - d) < 1.0
+        }) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// Score of a finished nest: fewer unplaced parts, then fewer sheets, then less sheet length used.
+fn score(parts: &[Part], n: &Nest) -> (usize, usize, i64) {
+    let length: f64 = (0..n.sheets).map(|k| used_length(parts, n, k)).sum();
+    (n.unplaced.len() + n.truncated, n.sheets, (length * 100.0).round() as i64)
+}
+
+/// How long the "Any (best fit)" search may run before it settles for the best nest found so far.
+#[cfg(not(target_arch = "wasm32"))]
+pub const SEARCH_BUDGET: web_time::Duration = web_time::Duration::from_secs(8);
+/// On the web the search shares the window's only thread, so it gets a short budget.
+#[cfg(target_arch = "wasm32")]
+pub const SEARCH_BUDGET: web_time::Duration = web_time::Duration::from_millis(1500);
+
+/// Multi-start search: every placement rule × every turn of the first (largest) part, run across the
+/// machine's cores until `budget` runs out or a nest needs no more sheets than the area allows.
+pub fn nest_search(parts: &[Part], s: &NestSettings, budget: web_time::Duration) -> Nest {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let mut base = Nest::default();
+    let items = instances(parts, &mut base);
+    let Some(prep) = prepare(parts, s, &search_angles) else {
+        base.unplaced = items;
+        return base;
+    };
+    let firsts = items.first().and_then(|i| prep.shapes.get(*i)).map_or(0, Vec::len).max(1);
+    let rules = [Rule::RightEdge, Rule::TopEdge, Rule::Compact];
+    let starts: Vec<(Rule, Option<usize>)> =
+        std::iter::once((Rule::RightEdge, None)).chain((0..firsts).flat_map(|f| rules.iter().map(move |r| (*r, Some(f))))).collect();
+    // Fewest sheets the parts' area could ever need: reaching it ends the search early.
+    let usable = ((s.sheet_w - 2.0 * s.margin.max(0.0)) * (s.sheet_h - 2.0 * s.margin.max(0.0))).max(1e-9);
+    let area: f64 = items.iter().filter_map(|i| parts.get(*i)).map(Part::area).sum();
+    let floor = ((area / usable).ceil() as usize).max(1);
+    let deadline = web_time::Instant::now() + budget;
+    let next = AtomicUsize::new(0);
+    let done = AtomicBool::new(false);
+    let best: Mutex<Option<((usize, usize, i64), Nest)>> = Mutex::new(None);
+    let work = || loop {
+        if done.load(Ordering::Relaxed) || web_time::Instant::now() >= deadline {
+            return;
+        }
+        let k = next.fetch_add(1, Ordering::Relaxed);
+        let Some((rule, first)) = starts.get(k).copied() else {
+            return;
+        };
+        let n = run(parts, s, &prep, &items, rule, first, base.clone());
+        let sc = score(parts, &n);
+        if sc.0 == 0 && sc.1 <= floor {
+            done.store(true, Ordering::Relaxed);
+        }
+        if let Ok(mut b) = best.lock()
+            && b.as_ref().is_none_or(|(old, _)| sc < *old)
+        {
+            *b = Some((sc, n));
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 16);
+        std::thread::scope(|scope| {
+            for _ in 1..threads {
+                scope.spawn(work);
+            }
+            work();
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    work();
+    best.into_inner().ok().flatten().map(|(_, n)| n).unwrap_or(base)
+}
+
+fn nest_once(parts: &[Part], s: &NestSettings) -> Nest {
+    let mut out = Nest::default();
+    let items = instances(parts, &mut out);
+    let Some(prep) = prepare(parts, s, &|p| s.angles_for(p)) else {
+        out.unplaced = items;
+        return out;
+    };
+    run(parts, s, &prep, &items, Rule::RightEdge, None, out)
+}
+
+/// The first place a part image fits, scanning columns from the origin (lowest in the first column with room)
+/// or rows (leftmost in the first row with room). `bound` stops the scan once nothing can beat it.
+fn first_fit(grid: &Bits, sh: &Shape, gw: usize, gh: usize, by_rows: bool, bound: Option<usize>) -> Option<(usize, usize)> {
+    let (w, h) = (sh.body.w, sh.body.h);
+    if w > gw || h > gh {
+        return None;
+    }
+    let free = |x: usize, y: usize| !sh.blocked(grid, x, y);
+    if by_rows {
+        for y in 0..=(gh - h) {
+            if bound.is_some_and(|b| y + h >= b) {
+                return None;
+            }
+            for x in 0..=(gw - w) {
+                if free(x, y) {
+                    return Some((x, y));
+                }
+            }
+        }
+    } else {
+        for x in 0..=(gw - w) {
+            if bound.is_some_and(|b| x + w >= b) {
+                return None;
+            }
+            for y in 0..=(gh - h) {
+                if free(x, y) {
+                    return Some((x, y));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// One nest run: each part in turn, on the first sheet that takes it, at the place and turn `rule` likes best.
+/// `first_turn` forces the image of the first part on each sheet (multi-start search).
+fn run(parts: &[Part], s: &NestSettings, prep: &Prepared, items: &[usize], rule: Rule, first_turn: Option<usize>, mut out: Nest) -> Nest {
+    let (cell, gw, gh) = (prep.cell, prep.gw, prep.gh);
+    out.cell = cell;
     let mut sheets: Vec<Bits> = Vec::new();
+    // What each sheet's placed parts reach, in cells (for Compact).
+    let mut reach: Vec<(usize, usize)> = Vec::new();
     // Holes of placed parts, per sheet, as cell boxes (x0, y0, x1, y1), for part-in-part.
     let mut holes: Vec<Vec<(usize, usize, usize, usize)>> = Vec::new();
-    for item in items {
-        let Some(variants) = shapes.get(item) else { continue };
+    for &item in items {
+        let Some(variants) = prep.shapes.get(item) else { continue };
         let mut placed = false;
         for sheet in 0..=sheets.len() {
             if sheet == sheets.len() {
@@ -919,10 +1108,12 @@ fn nest_once(parts: &[Part], s: &NestSettings) -> Nest {
                     break;
                 }
                 sheets.push(Bits::new(gw, gh));
+                reach.push((0, 0));
             }
             let Some(grid) = sheets.get(sheet) else { break };
-            // Best (top edge, x) over all rotations.
-            let mut best: Option<(usize, usize, usize, usize, usize)> = None; // (right edge, y, x, y, variant)
+            let (rx, ry) = reach.get(sheet).copied().unwrap_or((0, 0));
+            // (score, x, y, variant); lower score wins.
+            let mut best: Option<((usize, usize, usize), usize, usize, usize)> = None;
             // Part in part: a hole that takes the part wins outright.
             if s.part_in_part {
                 'holes: for &(x0, y0, x1, y1) in holes.get(sheet).map(Vec::as_slice).unwrap_or(&[]) {
@@ -933,8 +1124,8 @@ fn nest_once(parts: &[Part], s: &NestSettings) -> Nest {
                         }
                         for y in y0..=(y1 - h) {
                             for x in x0..=(x1 - w) {
-                                if !grid.hits(&sh.halo, x as i64 - sh.grow as i64, y as i64 - sh.grow as i64) {
-                                    best = Some((0, 0, x, y, vi));
+                                if !sh.blocked(grid, x, y) {
+                                    best = Some(((0, 0, 0), x, y, vi));
                                     break 'holes;
                                 }
                             }
@@ -942,36 +1133,57 @@ fn nest_once(parts: &[Part], s: &NestSettings) -> Nest {
                     }
                 }
             }
-            for (vi, sh) in variants.iter().enumerate() {
-                if best.is_some_and(|b| b.0 == 0) {
-                    break;
-                }
-                let (w, h) = (sh.body.w, sh.body.h);
-                if w > gw || h > gh {
-                    continue;
-                }
-                // Columns from the origin: the first fit in a column is the lowest; the first column with a fit
-                // gives this rotation's smallest right edge.
-                'cols: for x in 0..=(gw - w) {
-                    if best.is_some_and(|b| x + w >= b.0) {
-                        break;
+            if best.is_none() {
+                // The search forces the turn of the first part on each sheet: it decides how the rest interlock.
+                let empty = !out.placements.iter().any(|p| p.sheet == sheet);
+                let forced = first_turn.filter(|f| empty && *f < variants.len());
+                for (vi, sh) in variants.iter().enumerate() {
+                    if forced.is_some_and(|f| f != vi) {
+                        continue;
                     }
-                    for y in 0..=(gh - h) {
-                        if !grid.hits(&sh.halo, x as i64 - sh.grow as i64, y as i64 - sh.grow as i64) {
-                            let cand = (x + w, y, x, y, vi);
-                            if best.is_none_or(|b| (cand.0, cand.1) < (b.0, b.1)) {
-                                best = Some((cand.0, cand.1, cand.2, cand.3, cand.4));
+                    let (w, h) = (sh.body.w, sh.body.h);
+                    let consider = |x: usize, y: usize, best: &mut Option<((usize, usize, usize), usize, usize, usize)>| {
+                        let score = match rule {
+                            Rule::RightEdge => (x + w, y, 0),
+                            Rule::TopEdge => (y + h, x, 0),
+                            Rule::Compact => {
+                                let (bx, by) = (rx.max(x + w), ry.max(y + h));
+                                (bx.max(by), bx * by, x + y)
                             }
-                            break 'cols;
+                        };
+                        if best.is_none_or(|b| score < b.0) {
+                            *best = Some((score, x, y, vi));
+                        }
+                    };
+                    match rule {
+                        Rule::RightEdge => {
+                            if let Some((x, y)) = first_fit(grid, sh, gw, gh, false, best.map(|b| b.0.0)) {
+                                consider(x, y, &mut best);
+                            }
+                        }
+                        Rule::TopEdge => {
+                            if let Some((x, y)) = first_fit(grid, sh, gw, gh, true, best.map(|b| b.0.0)) {
+                                consider(x, y, &mut best);
+                            }
+                        }
+                        Rule::Compact => {
+                            for by_rows in [false, true] {
+                                if let Some((x, y)) = first_fit(grid, sh, gw, gh, by_rows, None) {
+                                    consider(x, y, &mut best);
+                                }
+                            }
                         }
                     }
                 }
             }
-            if let Some((_, _, x, y, vi)) = best
+            if let Some((_, x, y, vi)) = best
                 && let Some(sh) = variants.get(vi)
             {
                 if let Some(grid) = sheets.get_mut(sheet) {
                     grid.or_at(&sh.body, x, y);
+                }
+                if let Some(r) = reach.get_mut(sheet) {
+                    *r = (r.0.max(x + sh.body.w), r.1.max(y + sh.body.h));
                 }
                 let ox = s.margin + x as f64 * cell;
                 let oy = s.margin + y as f64 * cell;
@@ -1553,7 +1765,8 @@ pub struct PostSettings {
     pub overcut: f64,
     /// Select the material in QtPlasmaC with M190 and take its feed rate; otherwise write the tool's feed.
     pub use_material: bool,
-    /// Kerf compensation by the controller (G41.1 / G42.1 with the material's kerf).
+    /// Kerf compensation by the controller (G41.1 / G42.1 with the material's kerf). Off (the default, as
+    /// SheetCAM posts it): the CAM offsets the torch path by half the tool's kerf and the code has no G41.
     pub kerf_comp: bool,
     /// Holes smaller than this diameter run at `hole_speed_pct` (M67 E3); 0 = off.
     pub small_hole: f64,
@@ -1572,7 +1785,7 @@ impl Default for PostSettings {
             lead_out: 0.1 * MM_PER_IN,
             overcut: 0.0,
             use_material: true,
-            kerf_comp: true,
+            kerf_comp: false,
             small_hole: 1.25 * MM_PER_IN,
             hole_speed_pct: 60.0,
             rapid: 600.0 * MM_PER_IN,
@@ -1618,10 +1831,6 @@ fn polyline_len(pts: &[P2]) -> f64 {
 }
 
 impl Cut {
-    /// Every move after the pierce, in order.
-    pub fn moves(&self) -> impl Iterator<Item = &Seg> {
-        self.lead_in.iter().chain(self.contour.segs.iter()).chain(self.overcut.iter()).chain(self.lead_out.iter())
-    }
     /// The whole torch path from the pierce as a polyline, with the indices where the contour starts and ends.
     pub fn polyline(&self) -> (Vec<P2>, usize, usize) {
         fn push(segs: &[Seg], pts: &mut Vec<P2>, at: &mut P2) {
@@ -1703,6 +1912,215 @@ fn prefix(c: &Contour, len: f64) -> Vec<Seg> {
         at = s.end();
     }
     out
+}
+
+// --- Kerf offset ---------------------------------------------------------------------------------
+
+/// One piece of an offset path: a line or an arc from `a` to `b`.
+#[derive(Clone, Copy, Debug)]
+enum El {
+    Line { a: P2, b: P2 },
+    Arc { a: P2, b: P2, c: P2, r: f64, ccw: bool },
+}
+
+impl El {
+    fn a(&self) -> P2 {
+        match *self {
+            El::Line { a, .. } | El::Arc { a, .. } => a,
+        }
+    }
+    fn b(&self) -> P2 {
+        match *self {
+            El::Line { b, .. } | El::Arc { b, .. } => b,
+        }
+    }
+    fn set_a(&mut self, p: P2) {
+        match self {
+            El::Line { a, .. } | El::Arc { a, .. } => *a = p,
+        }
+    }
+    fn set_b(&mut self, p: P2) {
+        match self {
+            El::Line { b, .. } | El::Arc { b, .. } => *b = p,
+        }
+    }
+    fn seg(&self) -> Seg {
+        match *self {
+            El::Line { b, .. } => Seg::Line(b),
+            El::Arc { b, c, ccw, .. } => Seg::Arc { to: b, c, ccw },
+        }
+    }
+    fn tan(&self, at_end: bool) -> P2 {
+        tangent(self.a(), &self.seg(), at_end)
+    }
+}
+
+fn cross(a: P2, b: P2) -> f64 {
+    a[0] * b[1] - a[1] * b[0]
+}
+
+/// Where two offset pieces (extended: whole lines, whole circles) cross, nearest `near`.
+fn meet(p: &El, q: &El, near: P2) -> Option<P2> {
+    let line_circle = |a: P2, b: P2, c: P2, r: f64| -> Vec<P2> {
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let f = [a[0] - c[0], a[1] - c[1]];
+        let qa = d[0] * d[0] + d[1] * d[1];
+        let qb = 2.0 * (f[0] * d[0] + f[1] * d[1]);
+        let qc = f[0] * f[0] + f[1] * f[1] - r * r;
+        let disc = qb * qb - 4.0 * qa * qc;
+        if qa < 1e-18 || disc < 0.0 {
+            return Vec::new();
+        }
+        let s = disc.sqrt();
+        [(-qb - s) / (2.0 * qa), (-qb + s) / (2.0 * qa)].iter().map(|t| [a[0] + d[0] * t, a[1] + d[1] * t]).collect()
+    };
+    let found: Vec<P2> = match (*p, *q) {
+        (El::Line { a: a1, b: b1 }, El::Line { a: a2, b: b2 }) => {
+            let (d1, d2) = ([b1[0] - a1[0], b1[1] - a1[1]], [b2[0] - a2[0], b2[1] - a2[1]]);
+            let den = cross(d1, d2);
+            if den.abs() < 1e-12 {
+                Vec::new()
+            } else {
+                let t = cross([a2[0] - a1[0], a2[1] - a1[1]], d2) / den;
+                vec![[a1[0] + d1[0] * t, a1[1] + d1[1] * t]]
+            }
+        }
+        (El::Line { a, b }, El::Arc { c, r, .. }) | (El::Arc { c, r, .. }, El::Line { a, b }) => line_circle(a, b, c, r),
+        (El::Arc { c: c1, r: r1, .. }, El::Arc { c: c2, r: r2, .. }) => {
+            let d = dist(c1, c2);
+            if d < 1e-12 || d > r1 + r2 || d < (r1 - r2).abs() {
+                Vec::new()
+            } else {
+                let a = (r1 * r1 - r2 * r2 + d * d) / (2.0 * d);
+                let h = (r1 * r1 - a * a).max(0.0).sqrt();
+                let m = [c1[0] + a * (c2[0] - c1[0]) / d, c1[1] + a * (c2[1] - c1[1]) / d];
+                let (ox, oy) = (h * (c2[1] - c1[1]) / d, h * (c2[0] - c1[0]) / d);
+                vec![[m[0] + ox, m[1] - oy], [m[0] - ox, m[1] + oy]]
+            }
+        }
+    };
+    found.into_iter().filter(|x| x[0].is_finite() && x[1].is_finite()).min_by(|x, y| dist(*x, near).total_cmp(&dist(*y, near)))
+}
+
+/// A closed contour moved `d` mm to the left of travel (`left`) or the right, the way SheetCAM applies the kerf:
+/// lines shift, arcs grow or shrink about their centres, outside corners are rounded with arcs of radius `d`
+/// about the drawn corner, inside corners are trimmed where the moved pieces cross, and pieces the offset
+/// swallows (a fillet smaller than `d`, a notch narrower than the kerf) drop out.
+pub fn offset_contour(c: &Contour, d: f64, left: bool) -> Contour {
+    if !(d > 1e-9) || !d.is_finite() || c.segs.is_empty() {
+        return c.clone();
+    }
+    let mut dead = vec![false; c.segs.len()];
+    for _pass in 0..12 {
+        // Offset pieces, each with the drawn corner it ends at and its original sweep (arcs).
+        let mut els: Vec<(usize, El, P2, f64)> = Vec::new();
+        let mut from = c.start;
+        for (i, s) in c.segs.iter().enumerate() {
+            let to = s.end();
+            if !dead.get(i).copied().unwrap_or(true) {
+                match *s {
+                    Seg::Line(p) => {
+                        let l = dist(from, p);
+                        if l > 1e-9 {
+                            let t = [(p[0] - from[0]) / l, (p[1] - from[1]) / l];
+                            let n = if left { [-t[1] * d, t[0] * d] } else { [t[1] * d, -t[0] * d] };
+                            els.push((i, El::Line { a: [from[0] + n[0], from[1] + n[1]], b: [p[0] + n[0], p[1] + n[1]] }, to, 0.0));
+                        }
+                    }
+                    Seg::Arc { to, c: ctr, ccw } => {
+                        let r = dist(from, ctr);
+                        let r2 = if ccw == left { r - d } else { r + d };
+                        if r > 1e-9 && r2 > 1e-6 {
+                            // Both ends onto the new radius (a drawn arc's ends can sit a hair off one circle).
+                            let at = |p: P2| {
+                                let l = dist(p, ctr).max(1e-12);
+                                [ctr[0] + (p[0] - ctr[0]) * r2 / l, ctr[1] + (p[1] - ctr[1]) * r2 / l]
+                            };
+                            els.push((i, El::Arc { a: at(from), b: at(to), c: ctr, r: r2, ccw }, to, sweep(from, to, ctr, ccw)));
+                        } else if let Some(x) = dead.get_mut(i) {
+                            *x = true;
+                        }
+                    }
+                }
+            }
+            from = to;
+        }
+        let n = els.len();
+        if n == 0 {
+            return c.clone();
+        }
+        // Join each piece to the next.
+        let mut joins: Vec<Option<Seg>> = vec![None; n];
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let (Some(&(_, ei, v, _)), Some(&(_, ej, _, _))) = (els.get(i), els.get(j)) else { continue };
+            let (e, s) = (ei.b(), ej.a());
+            // Ends that already meet (within a fraction of LinuxCNC's arc tolerance) are simply joined.
+            if dist(e, s) < 5e-4 {
+                if let Some(x) = els.get_mut(j) {
+                    x.1.set_a(e);
+                }
+                continue;
+            }
+            let (te, ts) = (ei.tan(true), ej.tan(false));
+            let turn = cross(te, ts);
+            let gap = if left { turn < 0.0 } else { turn > 0.0 };
+            // Pieces meeting almost tangent (a drawing's rounding) are joined by the hair of a line between them.
+            if turn.abs() < 0.035 && te[0] * ts[0] + te[1] * ts[1] > 0.0 {
+                if let Some(x) = joins.get_mut(i) {
+                    *x = Some(Seg::Line(s));
+                }
+            } else if gap && (dist(e, v) - d).abs() < 1e-3 * d.max(1.0) && (dist(s, v) - d).abs() < 1e-3 * d.max(1.0) {
+                if let Some(x) = joins.get_mut(i) {
+                    *x = Some(Seg::Arc { to: s, c: v, ccw: !left });
+                }
+            } else if let Some(x) = meet(&ei, &ej, v).filter(|x| dist(*x, v) < 50.0 * d) {
+                if let Some(p) = els.get_mut(i) {
+                    p.1.set_b(x);
+                }
+                if let Some(q) = els.get_mut(j) {
+                    q.1.set_a(x);
+                }
+            } else if let Some(x) = joins.get_mut(i) {
+                *x = Some(Seg::Line(s));
+            }
+        }
+        // Pieces the trimming turned round are swallowed by the offset: drop them and join again.
+        let mut again = false;
+        if n > 1 {
+            for (i, el, _, sw) in &els {
+                let gone = match *el {
+                    El::Line { a, b } => {
+                        let o = c.segs.get(*i).map(|s| (if *i == 0 { c.start } else { c.segs.get(i - 1).map_or(c.start, Seg::end) }, s.end()));
+                        o.is_none_or(|(oa, ob)| (b[0] - a[0]) * (ob[0] - oa[0]) + (b[1] - a[1]) * (ob[1] - oa[1]) <= 0.0)
+                    }
+                    El::Arc { a, b, c: ctr, ccw, .. } => dist(a, b) > 1e-7 && sweep(a, b, ctr, ccw) > sw + 1e-6,
+                };
+                if gone && let Some(x) = dead.get_mut(*i) {
+                    *x = true;
+                    again = true;
+                }
+            }
+        }
+        if again && dead.iter().any(|x| !x) {
+            continue;
+        }
+        let start = els.first().map_or(c.start, |e| e.1.a());
+        let mut segs = Vec::with_capacity(n * 2);
+        for (k, (_, el, _, _)) in els.iter().enumerate() {
+            if dist(el.a(), el.b()) > 1e-7 || matches!(el, El::Arc { .. }) && n == 1 {
+                segs.push(el.seg());
+            }
+            if let Some(Some(j)) = joins.get(k) {
+                segs.push(*j);
+            }
+        }
+        if segs.is_empty() {
+            return c.clone();
+        }
+        return Contour::new(start, segs);
+    }
+    c.clone()
 }
 
 /// The cuts for one sheet in order, SheetCAM's "keep parts together": each part's holes then its outside, the
@@ -1789,6 +2207,8 @@ pub fn toolpath(parts: &[Part], nest: &Nest, sheet: usize, post: &PostSettings, 
             order.push((false, o));
         }
         for (hole, c) in order {
+            // Kerf in the CAM (SheetCAM's way): the torch path moves half a kerf toward the scrap side.
+            let c = if post.kerf_comp || part.side == Side::OnLine { c } else { offset_contour(&c, kerf / 2.0, scrap_left) };
             let (lo, hi) = c.bounds();
             let size = (hi[0] - lo[0]).min(hi[1] - lo[1]);
             // Leads that stay inside a hole: at most a third of its width.
@@ -1912,72 +2332,163 @@ pub fn along(pts: &[P2], frac: f64) -> (P2, Vec<P2>) {
     (done.last().copied().unwrap_or([0.0, 0.0]), done)
 }
 
-/// QtPlasmaC G-code for one sheet.
+/// A G-code number: fixed places, then trailing zeros (and a lone point) trimmed, as SheetCAM writes them.
+fn gnum(v: f64, places: usize) -> String {
+    let t = format!("{v:.places$}");
+    let t = if t.contains('.') { t.trim_end_matches('0').trim_end_matches('.').to_string() } else { t };
+    if t == "-0" { "0".into() } else { t }
+}
+
+/// Arcs that continue one another (same centre, radius and direction) merged into one move, so a drawn
+/// circle is a single full-circle G3 as SheetCAM writes it. `from` is where `segs` start.
+fn merge_arcs(from: P2, segs: &[Seg]) -> Vec<Seg> {
+    let mut out: Vec<Seg> = Vec::with_capacity(segs.len());
+    // Sweep so far of the arc being built, so a merge never passes a full turn.
+    let (mut at, mut swept) = (from, 0.0);
+    for s in segs {
+        let next = match (out.last_mut(), *s) {
+            (Some(Seg::Arc { to, c, ccw }), Seg::Arc { to: t2, c: c2, ccw: w2 })
+                if *ccw == w2 && dist(*c, c2) < 1e-6 && (dist(at, c2) - dist(t2, c2)).abs() < 1e-6 =>
+            {
+                let more = sweep(at, t2, c2, w2);
+                if swept + more <= TAU + 1e-6 {
+                    *to = t2;
+                    swept += more;
+                    None
+                } else {
+                    Some(*s)
+                }
+            }
+            _ => Some(*s),
+        };
+        if let Some(seg) = next {
+            swept = match seg {
+                Seg::Arc { to, c, ccw } => sweep(at, to, c, ccw),
+                Seg::Line(_) => 0.0,
+            };
+            out.push(seg);
+        }
+        at = s.end();
+    }
+    out
+}
+
+/// QtPlasmaC G-code for one sheet, laid out like SheetCAM's LinuxCNC PlasmaC post: pre-amble, material
+/// setup, then each cut as rapid, plasma start, lead-in, contour, lead-out and plasma end; post-amble and
+/// statistics. With kerf compensation off (the default) the path itself carries the kerf offset.
 pub fn gcode(parts: &[Part], nest: &Nest, sheet: usize, tool: &Tool, post: &PostSettings) -> String {
     use std::fmt::Write as _;
     let k = if post.inch { 1.0 / MM_PER_IN } else { 1.0 };
-    let n = |v: f64| if post.inch { format!("{:.5}", v * k) } else { format!("{:.4}", v * k) };
+    let places = if post.inch { 5 } else { 3 };
+    let n = |v: f64| gnum(v * k, places);
     let xy = |p: P2| format!("X{} Y{}", n(p[0]), n(p[1]));
+    let clean = |t: &str| t.replace(['(', ')'], "");
+    let cuts = toolpath(parts, nest, sheet, post, tool.kerf);
     let mut g = String::new();
-    let _ = writeln!(g, "(SolidCraft Plasma CAM - sheet {})", sheet + 1);
-    let _ = writeln!(g, "(tool {}: {})", tool.number, tool.name.replace(['(', ')'], ""));
+    let _ = writeln!(g, ";  program: SolidCraft Plasma Nest, sheet {}", sheet + 1);
+    let _ = writeln!(g, ";     tool: {} {}", tool.number, clean(&tool.name));
+    let _ = writeln!(g, ";     kerf: {}{}", n(tool.kerf), if post.kerf_comp { " (compensated by QtPlasmaC)" } else { " (offset in the toolpath)" });
+    let _ = writeln!(g, ";");
+    let _ = writeln!(g, ";begin pre-amble");
     if post.inch {
-        let _ = writeln!(g, "G20 G40 G49 G64 P0.004 G80 G90 G92.1 G94 G97");
+        let _ = writeln!(g, " G20 (units: inches)");
     } else {
-        let _ = writeln!(g, "G21 G40 G49 G64 P0.1 G80 G90 G92.1 G94 G97");
+        let _ = writeln!(g, " G21 (units: metric)");
     }
+    let _ = writeln!(g, " G40 (cutter compensation: off)");
+    let _ = writeln!(g, " G90 (distance mode: absolute)");
+    let _ = writeln!(g, " M52 P1 (adaptive feed: on)");
+    let _ = writeln!(g, " M65 P2 (enable THC)");
+    let _ = writeln!(g, " M65 P3 (enable torch)");
+    let _ = writeln!(g, " M68 E3 Q0 (velocity 100%)");
+    if post.inch {
+        let _ = writeln!(g, " G64 P0.01 Q0.001 (tracking tolerances: 0.01\")");
+    } else {
+        let _ = writeln!(g, " G64 P0.25 Q0.025 (tracking tolerances: 0.25mm)");
+    }
+    let _ = writeln!(g, ";end pre-amble");
+    let _ = writeln!(g, ";");
+    let _ = writeln!(g, ";begin material setup");
+    let _ = writeln!(g, " T0 M6 (select plasma tool)");
+    let _ = writeln!(g, " G43 H0 (apply tool offsets)");
     if post.use_material {
-        let _ = writeln!(g, "M190 P{}", tool.number);
-        let _ = writeln!(g, "M66 P3 L3 Q1");
-        let _ = writeln!(g, "F#<_hal[plasmac.cut-feed-rate]>");
+        let _ = writeln!(g, " M190 P{} ({} material)", tool.number, clean(&tool.name));
+        let _ = writeln!(g, " M66 P3 L3 Q2 (wait for valid change)");
+        let _ = writeln!(g, " F#<_hal[plasmac.cut-feed-rate]>");
     } else {
-        let _ = writeln!(g, "F{:.1}", tool.feed * k);
+        let _ = writeln!(g, " F{}", gnum(tool.feed * k, 1));
     }
+    let _ = writeln!(g, ";end material setup");
     let mut last_part = usize::MAX;
-    for cut in toolpath(parts, nest, sheet, post, tool.kerf) {
+    let mut length = 0.0;
+    for cut in &cuts {
         if cut.placement != last_part {
             last_part = cut.placement;
             let name = nest.placements.get(cut.placement).and_then(|p| parts.get(p.part)).map_or("part", |p| p.name.as_str());
-            let _ = writeln!(g, "({})", name.replace(['(', ')'], ""));
+            let _ = writeln!(g, ";{}", clean(name));
         }
-        let _ = writeln!(g, "G0 {}", xy(cut.pierce));
-        let _ = writeln!(g, "M3 $0 S1");
+        length += cut.length();
+        let _ = writeln!(g, " G0 {}", xy(cut.pierce));
+        let _ = writeln!(g, " M3 $0 S1 (plasma start)");
         match cut.comp {
             Comp::Left => {
-                let _ = writeln!(g, "G41.1 D#<_hal[plasmac_run.kerf-width-f]>");
+                let _ = writeln!(g, " G41.1 D#<_hal[plasmac_run.kerf-width-f]>");
             }
             Comp::Right => {
-                let _ = writeln!(g, "G42.1 D#<_hal[plasmac_run.kerf-width-f]>");
+                let _ = writeln!(g, " G42.1 D#<_hal[plasmac_run.kerf-width-f]>");
             }
             Comp::Off => {}
         }
         if cut.small {
-            let _ = writeln!(g, "M67 E3 Q{:.0}", post.hole_speed_pct.clamp(10.0, 100.0));
+            let pct = post.hole_speed_pct.clamp(10.0, 100.0);
+            let _ = writeln!(g, " M67 E3 Q{pct:.0} (velocity {pct:.0}%)");
         }
         let mut at = cut.pierce;
-        for s in cut.moves() {
-            match *s {
-                Seg::Line(p) => {
-                    if dist(at, p) > 1e-6 {
-                        let _ = writeln!(g, "G1 {}", xy(p));
+        let emit = |segs: &[Seg], at: &mut P2, g: &mut String| {
+            for s in merge_arcs(*at, segs) {
+                match s {
+                    Seg::Line(p) => {
+                        // A move too short to show in the output's places is left out.
+                        if xy(p) != xy(*at) {
+                            let _ = writeln!(g, " G1 {}", xy(p));
+                        }
+                    }
+                    Seg::Arc { to, c, ccw } => {
+                        let _ = writeln!(g, " {} {} I{} J{}", if ccw { "G3" } else { "G2" }, xy(to), n(c[0] - at[0]), n(c[1] - at[1]));
                     }
                 }
-                Seg::Arc { to, c, ccw } => {
-                    let _ = writeln!(g, "{} {} I{} J{}", if ccw { "G3" } else { "G2" }, xy(to), n(c[0] - at[0]), n(c[1] - at[1]));
-                }
+                *at = s.end();
             }
-            at = s.end();
-        }
+        };
+        emit(&cut.lead_in, &mut at, &mut g);
+        emit(&cut.contour.segs, &mut at, &mut g);
+        emit(&cut.overcut, &mut at, &mut g);
+        emit(&cut.lead_out, &mut at, &mut g);
         if cut.small {
-            let _ = writeln!(g, "M67 E3 Q0");
+            let _ = writeln!(g, " M67 E3 Q0 (velocity 100%)");
         }
         if cut.comp != Comp::Off {
-            let _ = writeln!(g, "G40");
+            let _ = writeln!(g, " G40 (cutter compensation: off)");
         }
-        let _ = writeln!(g, "M5 $0");
+        let _ = writeln!(g, " M5 $0 (plasma end)");
     }
-    let _ = writeln!(g, "G0 X0 Y0");
-    let _ = writeln!(g, "M2");
+    let _ = writeln!(g, " ;");
+    let _ = writeln!(g, " ;begin post-amble");
+    let _ = writeln!(g, " G40 (cutter compensation: off)");
+    let _ = writeln!(g, " G90 (distance mode: absolute)");
+    let _ = writeln!(g, " M65 P2 (enable THC)");
+    let _ = writeln!(g, " M65 P3 (enable torch)");
+    let _ = writeln!(g, " M68 E3 Q0 (velocity 100%)");
+    let _ = writeln!(g, " M5 $-1 (backup stop)");
+    let _ = writeln!(g, " ;end post-amble");
+    let _ = writeln!(g, " ;");
+    let _ = writeln!(g, " ;begin statistics");
+    let _ = writeln!(g, " ;Pierces = {}", cuts.len());
+    let unit = if post.inch { "\"" } else { "mm" };
+    let _ = writeln!(g, " ;   Cuts = {},    Length = {:.2}{unit}", cuts.len(), length * k);
+    let _ = writeln!(g, " ;end statistics");
+    let _ = writeln!(g, " ;");
+    let _ = writeln!(g, " M30 (end program)");
     g
 }
 
@@ -2120,6 +2631,89 @@ mod tests {
         assert!(n.sheets <= 2, "{} sheets", n.sheets);
     }
 
+    /// A customer's wheel center (inches, as G-code moves: a start point then lines and arcs). SheetCAM
+    /// nests four on a 24" x 24" sheet at 1/8" spacing; best fit must too.
+    const WHEEL_HOLE: &str = "G1 X8.29776 Y6.48243
+    G3 X6.61026 Y8.16993 I-1.68750 J0.00000
+    G3 X6.61026 Y4.79493 I0.00000 J-1.68750
+    G3 X8.29776 Y6.48243 I0.00000 J1.68750";
+    const WHEEL_OUTER: &str = "G1 X9.36026 Y6.48243
+    G2 X9.31597 Y5.99090 I-2.75000 J0.00000
+    G3 X9.49666 Y5.51022 I0.49195 J-0.08937
+    G1 X12.36823 Y3.22607
+    G2 X11.48656 Y2.01254 I-5.75798 J3.25636
+    G1 X8.42683 Y4.03773
+    G3 X7.91385 Y4.06104 I-0.27597 J-0.41694
+    G2 X6.97889 Y3.75725 I-1.30359 J2.42139
+    G3 X6.57758 Y3.43687 I0.06702 J-0.49549
+    G1 X5.29258 Y0.00000
+    G2 X3.86600 Y0.46353 I1.31767 J6.48243
+    G1 X4.84656 Y3.99931
+    G3 X4.71021 Y4.49439 I-0.48182 J0.13362
+    G2 X4.13237 Y5.28972 I1.90005 J1.98804
+    G3 X3.70365 Y5.57238 I-0.45053 J-0.21686
+    G1 X0.03791 Y5.73243
+    G2 X0.03791 Y7.23243 I6.57235 J0.75000
+    G1 X3.70365 Y7.39248
+    G3 X4.13237 Y7.67515 I-0.02181 J0.49952
+    G2 X4.71021 Y8.47048 I2.47789 J-1.19272
+    G3 X4.84656 Y8.96556 I-0.34546 J0.36146
+    G1 X3.86600 Y12.50134
+    G2 X5.29258 Y12.96487 I2.74426 J-6.01891
+    G1 X6.57758 Y9.52800
+    G3 X6.97889 Y9.20762 I0.46834 J0.17510
+    G2 X7.91385 Y8.90383 I-0.36863 J-2.72518
+    G3 X8.42683 Y8.92714 I0.23702 J0.44025
+    G1 X11.48656 Y10.95233
+    G2 X12.36823 Y9.73880 I-4.87630 J-4.46989
+    G1 X9.49666 Y7.45465
+    G3 X9.31597 Y6.97397 I0.31126 J-0.39130
+    G2 X9.36026 Y6.48243 I-2.70571 J-0.49154";
+
+    fn contour_from_moves(text: &str) -> Contour {
+        let val = |l: &str, c: char| l.split_whitespace().find_map(|w| w.strip_prefix(c)?.parse::<f64>().ok()).unwrap() * 25.4;
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+        let first = lines.next().unwrap();
+        let start = [val(first, 'X'), val(first, 'Y')];
+        let mut at = start;
+        let mut segs = Vec::new();
+        for l in lines {
+            let p = [val(l, 'X'), val(l, 'Y')];
+            segs.push(if l.starts_with("G1") {
+                Seg::Line(p)
+            } else {
+                Seg::Arc { to: p, c: [at[0] + val(l, 'I'), at[1] + val(l, 'J')], ccw: l.starts_with("G3") }
+            });
+            at = p;
+        }
+        Contour::new(start, segs)
+    }
+
+    #[test]
+    fn best_fit_nests_four_wheel_centers_on_a_24_inch_sheet() {
+        let mut wheel = part_from_contours("wheel", vec![contour_from_moves(WHEEL_OUTER), contour_from_moves(WHEEL_HOLE)]).unwrap();
+        wheel.qty = 4;
+        let parts = vec![wheel];
+        let s = NestSettings {
+            sheet_w: 24.0 * 25.4,
+            sheet_h: 24.0 * 25.4,
+            spacing: 0.125 * 25.4,
+            margin: 0.0,
+            rotation_step: BEST_FIT,
+            max_sheets: 4,
+            part_in_part: true,
+        };
+        // Plain quarter turns only fit three.
+        let quarter = nest(&parts, &NestSettings { rotation_step: 90.0, ..s });
+        assert!(quarter.sheets > 1);
+        let n = nest_search(&parts, &s, web_time::Duration::from_secs(300));
+        assert_eq!((n.placements.len(), n.sheets), (4, 1), "angles {:?}", n.placements.iter().map(|p| p.angle_deg).collect::<Vec<_>>());
+        for i in 0..n.placements.len() {
+            let (hits, off) = contacts(&parts, &n, i, &s);
+            assert!(hits.is_empty() && !off, "placement {i} touches {hits:?} off={off}");
+        }
+    }
+
     #[test]
     fn best_fit_rotation_nests_without_contact_and_squares_a_tilted_part() {
         // A rectangle drawn at 30 degrees: best fit turns it square to the sheet.
@@ -2243,7 +2837,7 @@ mod tests {
     fn check_gcode(g: &str) {
         let mut at = [0.0f64, 0.0];
         let mut after_comp = false;
-        for line in g.lines() {
+        for line in g.lines().map(str::trim_start).filter(|l| !l.starts_with(';')) {
             let val = |c: char| line.split_whitespace().find_map(|w| w.strip_prefix(c)?.parse::<f64>().ok());
             let motion = line.starts_with("G0 ") || line.starts_with("G1 ") || line.starts_with("G2 ") || line.starts_with("G3 ");
             if after_comp && motion {
@@ -2264,6 +2858,103 @@ mod tests {
         }
     }
 
+    /// Furthest and nearest any point of `a` lies from the outline of `b`.
+    fn gap_range(a: &Contour, b: &Contour) -> (f64, f64) {
+        let seg_d = |p: P2, a: P2, b: P2| {
+            let d = [b[0] - a[0], b[1] - a[1]];
+            let l2 = (d[0] * d[0] + d[1] * d[1]).max(1e-18);
+            let t = (((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1]) / l2).clamp(0.0, 1.0);
+            dist(p, lerp(a, b, t))
+        };
+        // The outline of `b` finely divided, so chord sag does not count as distance.
+        let mut fine = vec![b.start];
+        let mut at = b.start;
+        for s in &b.segs {
+            if let Seg::Arc { to, c, ccw } = *s {
+                let (r, sw, a0) = (dist(at, c), sweep(at, to, c, ccw), (at[1] - c[1]).atan2(at[0] - c[0]));
+                let k = (sw.to_degrees() * 20.0).ceil() as usize;
+                fine.extend((1..k).map(|i| {
+                    let a = a0 + if ccw { 1.0 } else { -1.0 } * sw * i as f64 / k as f64;
+                    [c[0] + r * a.cos(), c[1] + r * a.sin()]
+                }));
+            }
+            fine.push(s.end());
+            at = s.end();
+        }
+        let n = fine.len();
+        let ds: Vec<f64> = a.pts.iter().map(|p| (0..n).map(|i| seg_d(*p, fine[i], fine[(i + 1) % n])).fold(f64::INFINITY, f64::min)).collect();
+        (ds.iter().copied().fold(f64::INFINITY, f64::min), ds.iter().copied().fold(0.0, f64::max))
+    }
+
+    #[test]
+    fn kerf_offset_keeps_half_a_kerf_off_every_edge_on_the_scrap_side() {
+        let tool = default_tools().into_iter().find(|t| t.number == 44).unwrap();
+        let half = tool.kerf / 2.0;
+        let wheel = part_from_contours("wheel", vec![contour_from_moves(WHEEL_OUTER), contour_from_moves(WHEEL_HOLE)]).unwrap();
+        let mut parts = sample_parts();
+        parts.push(wheel);
+        for part in &parts {
+            for (i, c) in part.contours.iter().enumerate() {
+                for left in [true, false] {
+                    let o = offset_contour(c, half, left);
+                    let (lo, hi) = gap_range(&o, c);
+                    assert!((lo - half).abs() < 0.03 && (hi - half).abs() < 0.03, "{} contour {i} left={left}: {lo}..{hi} vs {half}", part.name);
+                    // Joined end to end, and every arc a true arc.
+                    let mut at = o.start;
+                    for s in &o.segs {
+                        if let Seg::Arc { to, c, .. } = *s {
+                            assert!((dist(at, c) - dist(to, c)).abs() < 1e-3, "{}: arc ends off its circle", part.name);
+                        }
+                        at = s.end();
+                    }
+                    assert!(dist(at, o.start) < 1e-6, "{} contour {i} is closed", part.name);
+                    // Left of a clockwise outline is outside it (bigger); left of a counter-clockwise hole is inside it.
+                    let grows = left == (c.signed_area() < 0.0);
+                    assert_eq!(o.signed_area().abs() > c.signed_area().abs(), grows, "{} contour {i} left={left}", part.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn toolpath_cuts_outside_outsides_and_inside_holes_by_half_the_kerf() {
+        let tool = default_tools().into_iter().find(|t| t.number == 44).unwrap();
+        let half = tool.kerf / 2.0;
+        let mut wheel = part_from_contours("wheel", vec![contour_from_moves(WHEEL_OUTER), contour_from_moves(WHEEL_HOLE)]).unwrap();
+        wheel.qty = 1;
+        for side in [Side::Outside, Side::Inside, Side::OnLine] {
+            for reverse in [false, true] {
+                let parts = vec![Part { side, reverse, ..wheel.clone() }];
+                let n = nest(&parts, &settings(90.0));
+                let pl = &n.placements[0];
+                for cut in toolpath(&parts, &n, 0, &PostSettings::default(), tool.kerf) {
+                    let drawn = pl.contour(&parts[0].contours[if cut.hole { 1 } else { 0 }]);
+                    let (lo, hi) = gap_range(&cut.contour, &drawn);
+                    let want = if side == Side::OnLine { 0.0 } else { half };
+                    assert!((lo - want).abs() < 0.03 && (hi - want).abs() < 0.03, "{side:?} hole={}: {lo}..{hi}", cut.hole);
+                    // Outside: the outline grows and the hole shrinks; Inside the other way round.
+                    let bigger = cut.contour.signed_area().abs() > drawn.signed_area().abs();
+                    match side {
+                        Side::Outside => assert_eq!(bigger, !cut.hole, "outside, hole={}", cut.hole),
+                        Side::Inside => assert_eq!(bigger, cut.hole, "inside, hole={}", cut.hole),
+                        Side::OnLine => {}
+                    }
+                }
+            }
+        }
+        // As SheetCAM posts it: the round hole is one full-circle G3 of the hole's radius less half the kerf.
+        let parts = vec![wheel];
+        let n = nest(&parts, &settings(90.0));
+        let g = gcode(&parts, &n, 0, &tool, &PostSettings::default());
+        check_gcode(&g);
+        let r = 1.6875 - half / MM_PER_IN;
+        let full = g.lines().map(str::trim).filter(|l| l.starts_with("G3 ")).filter(|l| {
+            let v = |c: char| l.split_whitespace().find_map(|w| w.strip_prefix(c)?.parse::<f64>().ok()).unwrap_or(0.0);
+            ((v('I').powi(2) + v('J').powi(2)).sqrt() - r).abs() < 2e-4
+        });
+        assert_eq!(full.count(), 1, "{g}");
+    }
+
     #[test]
     fn gcode_uses_arcs_material_and_kerf_comp() {
         let parts = sample_parts();
@@ -2271,13 +2962,29 @@ mod tests {
         let tool = default_tools().into_iter().find(|t| t.number == 61).unwrap();
         let g = gcode(&parts, &n, 0, &tool, &PostSettings::default());
         let contours: usize = n.placements.iter().filter(|p| p.sheet == 0).map(|p| parts[p.part].contours.len()).sum();
-        assert_eq!(g.matches("M3 $0 S1").count(), contours);
-        assert_eq!(g.matches("G41.1").count(), contours);
-        assert!(g.contains("M190 P61\nM66 P3 L3 Q1\nF#<_hal[plasmac.cut-feed-rate]>"));
+        assert_eq!(g.matches("M3 $0 S1 (plasma start)").count(), contours);
+        assert_eq!(g.matches("M5 $0 (plasma end)").count(), contours);
+        // SheetCAM's layout: the kerf is in the path, so no G41.1; material setup; backup stop and M30.
+        assert_eq!(g.matches("G41.1").count() + g.matches("G42.1").count(), 0);
+        assert!(g.contains(" G20 (units: inches)\n G40 (cutter compensation: off)\n G90 (distance mode: absolute)"));
+        assert!(g.contains(" T0 M6 (select plasma tool)\n G43 H0 (apply tool offsets)\n M190 P61 ("));
+        assert!(g.contains(" M66 P3 L3 Q2 (wait for valid change)\n F#<_hal[plasmac.cut-feed-rate]>"));
+        assert!(g.contains(&format!(" ;Pierces = {contours}")));
+        assert!(g.contains(" M5 $-1 (backup stop)"));
+        assert!(g.trim_end().ends_with(" M30 (end program)"));
+        assert!(!g.contains("G0 X0 Y0"), "no return to the origin");
         assert!(g.contains("G2 ") && g.contains("G3 "), "circles and corners post as arcs");
-        assert!(g.contains("M67 E3 Q60"), "small holes slow down");
-        assert!(g.trim_end().ends_with("M2"));
+        assert!(g.contains("M67 E3 Q60 (velocity 60%)") && g.contains("M67 E3 Q0 (velocity 100%)"), "small holes slow down");
+        assert!(
+            !g.lines()
+                .any(|l| l.split_whitespace().any(|w| w.len() > 1 && w.ends_with('0') && w.contains('.') && w.starts_with(['X', 'Y', 'I', 'J']))),
+            "trailing zeros trimmed"
+        );
         check_gcode(&g);
+        // Controller compensation, the old way, is still there behind the setting.
+        let g41 = gcode(&parts, &n, 0, &tool, &PostSettings { kerf_comp: true, ..PostSettings::default() });
+        assert_eq!(g41.matches("G41.1").count(), contours);
+        check_gcode(&g41);
         // A rotated nest still posts true arcs.
         let n45 = nest(&parts, &settings(45.0));
         let g45 = gcode(&parts, &n45, 0, &tool, &PostSettings::default());
@@ -2299,29 +3006,37 @@ mod tests {
                         p.reverse = reverse;
                     }
                     let n = nest(&parts, &settings(90.0));
-                    let post = PostSettings { lead_in_kind, lead_out_kind, overcut, ..PostSettings::default() };
-                    let g = gcode(&parts, &n, 0, &tool, &post);
-                    check_gcode(&g);
-                    let contours: usize = n.placements.iter().filter(|p| p.sheet == 0).map(|p| parts[p.part].contours.len()).sum();
-                    let (left, right) = (g.matches("G41.1").count(), g.matches("G42.1").count());
-                    match (side, reverse) {
-                        (Side::OnLine, _) => assert_eq!(left + right, 0),
-                        (_, false) => assert_eq!((left, right), (contours, 0)),
-                        (_, true) => assert_eq!((left, right), (0, contours)),
-                    }
-                    for cut in toolpath(&parts, &n, 0, &post, tool.kerf) {
-                        // Direction: outsides clockwise unless Inside xor Reverse.
-                        let flip = (side == Side::Inside) != reverse;
-                        let ccw = cut.contour.signed_area() > 0.0;
-                        assert_eq!(ccw, cut.hole != flip, "{side:?} reverse={reverse} hole={}", cut.hole);
-                        if lead_in_kind == Lead::None && side == Side::OnLine {
-                            continue;
+                    for kerf_comp in [false, true] {
+                        let post = PostSettings { lead_in_kind, lead_out_kind, overcut, kerf_comp, ..PostSettings::default() };
+                        let g = gcode(&parts, &n, 0, &tool, &post);
+                        check_gcode(&g);
+                        let contours: usize = n.placements.iter().filter(|p| p.sheet == 0).map(|p| parts[p.part].contours.len()).sum();
+                        let (left, right) = (g.matches("G41.1").count(), g.matches("G42.1").count());
+                        match (side, reverse) {
+                            _ if !kerf_comp => assert_eq!(left + right, 0),
+                            (Side::OnLine, _) => assert_eq!(left + right, 0),
+                            (_, false) => assert_eq!((left, right), (contours, 0)),
+                            (_, true) => assert_eq!((left, right), (0, contours)),
                         }
-                        // The pierce is on the scrap side of the line.
-                        let inside_line = inside(cut.pierce, &cut.contour);
-                        let scrap_inside = cut.hole != (side == Side::Inside);
-                        if side != Side::OnLine {
-                            assert_eq!(inside_line, scrap_inside, "{side:?} reverse={reverse} hole={} {lead_in_kind:?}", cut.hole);
+                        for cut in toolpath(&parts, &n, 0, &post, tool.kerf) {
+                            // No lead-in means none: the torch fires on the path itself.
+                            if lead_in_kind == Lead::None && !kerf_comp {
+                                assert!(cut.lead_in.is_empty() && dist(cut.pierce, cut.contour.start) < 1e-9);
+                                continue;
+                            }
+                            // Direction: outsides clockwise unless Inside xor Reverse.
+                            let flip = (side == Side::Inside) != reverse;
+                            let ccw = cut.contour.signed_area() > 0.0;
+                            assert_eq!(ccw, cut.hole != flip, "{side:?} reverse={reverse} hole={}", cut.hole);
+                            if lead_in_kind == Lead::None && side == Side::OnLine {
+                                continue;
+                            }
+                            // The pierce is on the scrap side of the line.
+                            let inside_line = inside(cut.pierce, &cut.contour);
+                            let scrap_inside = cut.hole != (side == Side::Inside);
+                            if side != Side::OnLine {
+                                assert_eq!(inside_line, scrap_inside, "{side:?} reverse={reverse} hole={} {lead_in_kind:?}", cut.hole);
+                            }
                         }
                     }
                 }

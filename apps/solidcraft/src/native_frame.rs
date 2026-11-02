@@ -21,6 +21,13 @@
 //! The procedure is installed once, on the thread that owns the window, for the main window only,
 //! and calls the previous one (winit's) for everything it doesn't answer.
 //!
+//! It keeps typing from ringing the system's error sound. After a native dialog (a file picker)
+//! closes, Windows can leave the window active with no keyboard focus; keys then arrive as
+//! `WM_SYSKEYDOWN`/`WM_SYSCHAR`, and with no menu to match them the default procedure beeps on
+//! every key. On activation, and on a system key without Alt, the window takes the focus back
+//! (`SetFocus`), and an Alt+key menu shortcut (`SC_KEYMENU`), which a window without a menu can
+//! only answer with a beep, is dropped.
+//!
 //! [`set_class_icon`] gives the window's class the exe's icon, so the taskbar button shows the
 //! mark even when the window is too busy to answer the taskbar's request for its icon.
 #![allow(unsafe_code)]
@@ -33,10 +40,12 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, GCLP_HICON, GCLP_HICONSM, GWL_STYLE, GWLP_WNDPROC, GetClientRect, GetWindowLongPtrW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT,
-    HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IMAGE_ICON, IsIconic, IsZoomed, LR_DEFAULTCOLOR, LoadImageW, SM_CXICON,
-    SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CXSMICON, SetWindowLongPtrW, WM_GETDPISCALEDSIZE, WM_NCDESTROY, WM_NCHITTEST, WNDPROC, WS_THICKFRAME,
+    HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IMAGE_ICON, IsIconic, IsZoomed, LR_DEFAULTCOLOR, LoadImageW, SC_KEYMENU, SM_CXICON,
+    SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CXSMICON, SetWindowLongPtrW, WM_ACTIVATE, WM_GETDPISCALEDSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_SYSCHAR,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN, WNDPROC, WS_THICKFRAME,
 };
 // windows-sys has SetClassLongPtrW only on 64-bit targets; on 32-bit Windows it is SetClassLongW.
 #[cfg(target_pointer_width = "64")]
@@ -168,6 +177,20 @@ unsafe extern "system" fn frame_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 _ => call_previous(),
             }
         }
+        WM_ACTIVATE => {
+            let r = call_previous();
+            // Active (not WA_INACTIVE) with nothing focused: take the keyboard back.
+            if wparam & 0xFFFF != 0 {
+                take_focus(hwnd);
+            }
+            r
+        }
+        WM_SYSKEYDOWN | WM_SYSCHAR if lparam & (1 << 29) == 0 => {
+            // A "system" key without Alt only happens when no window has the focus.
+            take_focus(hwnd);
+            call_previous()
+        }
+        WM_SYSCOMMAND if wparam & 0xFFF0 == SC_KEYMENU as usize && lparam != 0 && lparam != 0x20 => 0,
         WM_NCDESTROY => {
             // Hand the window back to winit's procedure for its last message.
             if prev.is_some() {
@@ -177,6 +200,16 @@ unsafe extern "system" fn frame_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             call_previous()
         }
         _ => call_previous(),
+    }
+}
+
+/// Give the window the keyboard focus if nothing in this thread has it.
+fn take_focus(hwnd: HWND) {
+    // SAFETY: plain focus calls on the window handle the system passed in, on its own thread.
+    unsafe {
+        if GetFocus().is_null() {
+            SetFocus(hwnd);
+        }
     }
 }
 

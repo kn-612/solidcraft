@@ -689,6 +689,12 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
         })),
         "ui.file" => {
             let Some(path) = s("path") else { return err("path is required") };
+            if crate::plasma_cam::takes_path(app, path) {
+                // Plasma Nest open: a DXF is a part for the nest, not a design.
+                crate::plasma_cam::import_path(app, path);
+                let message = app.plasma_cam.message.as_ref().map(|m| m.0.clone()).unwrap_or_default();
+                return ok(json!({"busy": false, "plasma_parts": app.plasma_cam.parts.len(), "message": message}));
+            }
             if p.get("insert").and_then(Value::as_bool).unwrap_or(false) {
                 app.insert_path_async(path);
             } else {
